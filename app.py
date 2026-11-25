@@ -31,25 +31,37 @@ def fetch_cboe(url):
     return raw["data"], raw.get("timestamp", "Unknown")
 
 @st.cache_data(ttl=120)
-def fetch_es_cvd():
-    """Estimates ES session CVD & 15m absorption from 1m ES=F bars."""
+def fetch_es_data():
+    """Fetches 1m ES=F bars for Est. CVD, Absorption, and 9:30-9:45 AM ET Opening Range."""
     try:
-        df = yf.Ticker("ES=F").history(period="1d", interval="1m")
+        df = yf.Ticker("ES=F").history(period="2d", interval="1m")
         if df.empty or len(df) < 15:
             return None
-        rng = (df["High"] - df["Low"]).replace(0, np.nan)
-        buy_ratio = ((df["Close"] - df["Low"]) / rng).fillna(0.5).clip(0, 1)
-        df["delta"] = df["Volume"] * (2.0 * buy_ratio - 1.0)
-        df["cvd"] = df["delta"].cumsum()
 
-        last_15 = df.tail(15)
+        # Convert index to New York time (ET)
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC").tz_convert("America/New_York")
+        else:
+            df.index = df.index.tz_convert("America/New_York")
+
+        # Use latest calendar date in feed for session CVD
+        latest_day = df.index[-1].date()
+        day_df = df[df.index.date == latest_day].copy()
+        if len(day_df) < 15:
+            day_df = df.tail(60).copy()
+
+        rng = (day_df["High"] - day_df["Low"]).replace(0, np.nan)
+        buy_ratio = ((day_df["Close"] - day_df["Low"]) / rng).fillna(0.5).clip(0, 1)
+        day_df["delta"] = day_df["Volume"] * (2.0 * buy_ratio - 1.0)
+        day_df["cvd"] = day_df["delta"].cumsum()
+
+        last_15 = day_df.tail(15)
         cvd_15m = float(last_15["delta"].sum())
         vol_15m = float(last_15["Volume"].sum())
         px_chg_15m = float(last_15["Close"].iloc[-1] - last_15["Close"].iloc[0])
-        es_last = float(df["Close"].iloc[-1])
-        es_time = df.index[-1].strftime("%H:%M %Z")
+        es_last = float(day_df["Close"].iloc[-1])
+        es_time = day_df.index[-1].strftime("%H:%M ET")
 
-        # Absorption check: strong 15m directional CVD (>25% of 15m vol) but price stalled (<2.5 pts)
         delta_pct = abs(cvd_15m) / max(vol_15m, 1.0)
         if delta_pct > 0.22 and abs(px_chg_15m) < 2.5:
             absorb = "BUYER ABSORPTION (Ceiling)" if cvd_15m > 0 else "SELLER ABSORPTION (Floor)"
@@ -60,10 +72,25 @@ def fetch_es_cvd():
         else:
             absorb = "BALANCED / CHOP"
 
+        # 9:30 - 9:44 AM ET Opening Range (15-min window)
+        or_bars = day_df.between_time("09:30", "09:44")
+        if len(or_bars) >= 10:
+            or_high = float(or_bars["High"].max())
+            or_low = float(or_bars["Low"].min())
+            or_mid = (or_high + or_low) / 2.0
+            or_ready = True
+        else:
+            # Pre-market fallback: Overnight High / Low
+            or_high = float(day_df["High"].max())
+            or_low = float(day_df["Low"].min())
+            or_mid = (or_high + or_low) / 2.0
+            or_ready = False
+
         return {
             "es_last": es_last, "es_time": es_time,
-            "cvd_sess": float(df["cvd"].iloc[-1]), "cvd_15m": cvd_15m,
+            "cvd_sess": float(day_df["cvd"].iloc[-1]), "cvd_15m": cvd_15m,
             "px_chg_15m": px_chg_15m, "absorb": absorb,
+            "or_ready": or_ready, "or_high": or_high, "or_low": or_low, "or_mid": or_mid,
         }
     except Exception:
         return None
@@ -83,8 +110,6 @@ def analyze_chain(chain, scope="All Exp"):
     spot = float(chain["current_price"])
     today = date.today()
     strikes, Ts, ivs, ois, vols, signs = [], [], [], [], [], []
-
-    # Track 0DTE flow separately regardless of scope
     dte0_call_vol, dte0_put_vol = 0.0, 0.0
     dte0_strikes = {}
 
@@ -155,7 +180,6 @@ def analyze_chain(chain, scope="All Exp"):
         i = cross[0]
         zero_gamma = grid[i] - totals[i] * (grid[i + 1] - grid[i]) / (totals[i + 1] - totals[i])
 
-    # Top 0DTE hot strikes
     hot_0dte = sorted(
         [(k, v["c_vol"] + v["p_vol"], (v["c_vol"] + v["p_vol"]) / max(v["oi"], 1.0),
           "CALLS" if v["c_vol"] >= v["p_vol"] else "PUTS")
@@ -234,14 +258,14 @@ scope = c1.radio("Expiration Scope", ["All Exp", "0DTE"], horizontal=True)
 if c2.button("Refresh Live Data"):
     st.cache_data.clear()
 
-with st.spinner("Loading Cboe chains, 0DTE flow, VIX & ES CVD..."):
+with st.spinner("Loading Cboe chains, 0DTE flow, VIX & ES Opening Range..."):
     spx_raw, spx_ts = fetch_cboe(URLS["SPX"])
     qqq_raw, _ = fetch_cboe(URLS["QQQ"])
     vix, _ = fetch_cboe(URLS["VIX"])
     vix1d, _ = fetch_cboe(URLS["VIX1D"])
     spx = analyze_chain(spx_raw, scope=scope)
     qqq = analyze_chain(qqq_raw, scope="All Exp")
-    es = fetch_es_cvd()
+    es = fetch_es_data()
 
 st.info(f"**Data Timestamp:** Cboe Chain `{format_age(spx_ts)}` | ES Futures: `{es['es_time'] if es else 'Unavailable'}` | Page Refreshed: `{datetime.now().strftime('%H:%M:%S')}`")
 
@@ -293,6 +317,44 @@ elif score <= -2:
     st.error(f"**BEARISH BIAS ({score:+d}/5) — {regime_txt}** | Selling pressure active. Rallies into walls risk rejecting.")
 else:
     st.warning(f"**MIXED / NEUTRAL ({score:+d}/5) — {regime_txt}** | Wait for a level test + ES CVD/VIX confirmation.")
+
+# --- 9:30-9:45 AM ET OPENING RANGE & BIAS TRACKER ---
+if es:
+    with st.container(border=True):
+        if es["or_ready"]:
+            st.markdown("### ⏱️ 9:30–9:45 AM ET Opening Range (ES Futures)")
+            if es["es_last"] > es["or_high"]:
+                if score >= 1 and vix_chg <= 0:
+                    or_badge = "🟢 ABOVE OR HIGH — CONFIRMED BULLISH BREAKOUT"
+                    or_tip = "ES broke above the 15m Opening Range with VIX/Vanna support. Look for pullbacks to OR High to target the next upside GEX wall."
+                else:
+                    or_badge = "⚠️ ABOVE OR HIGH — FAKEOUT / TRAP WARNING"
+                    or_tip = "ES poked above OR High, but VIX/Vanna is NOT confirming. Watch for a snap-back inside the range."
+            elif es["es_last"] < es["or_low"]:
+                if score <= -1 and vix_chg >= 0:
+                    or_badge = "🔴 BELOW OR LOW — CONFIRMED BEARISH BREAKDOWN"
+                    or_tip = "ES broke below the 15m Opening Range with rising VIX/selling pressure. Look for bounces to OR Low to target the next downside wall."
+                else:
+                    or_badge = "⚠️ BELOW OR LOW — SWEEP / REVERSAL WARNING"
+                    or_tip = "ES broke OR Low, but VIX is not expanding. Watch for a liquidity sweep and reclaim back inside the range."
+            else:
+                or_badge = "🟡 INSIDE OPENING RANGE — CHOP / WAIT"
+                or_tip = "Price is still inside the 9:30–9:45 AM range. Wait for a clean 5m close outside OR High or OR Low."
+
+            o1, o2, o3, o4 = st.columns(4)
+            o1.metric("OR High", f"{es['or_high']:.2f}", f"{es['es_last'] - es['or_high']:+.2f} pts")
+            o2.metric("OR Mid", f"{es['or_mid']:.2f}")
+            o3.metric("OR Low", f"{es['or_low']:.2f}", f"{es['es_last'] - es['or_low']:+.2f} pts")
+            o4.metric("ES Last", f"{es['es_last']:.2f}")
+            st.markdown(f"**Status:** `{or_badge}`")
+            st.caption(or_tip)
+        else:
+            st.markdown("### 🌙 Pre-Market / Overnight Range (Waiting for 9:45 AM ET)")
+            o1, o2, o3 = st.columns(3)
+            o1.metric("Overnight High", f"{es['or_high']:.2f}")
+            o2.metric("ES Last", f"{es['es_last']:.2f}")
+            o3.metric("Overnight Low", f"{es['or_low']:.2f}")
+            st.caption("The 9:30–9:45 AM ET Opening Range will lock in automatically at 9:45 AM ET.")
 
 # --- 0DTE FLOW & ES CVD / ABSORPTION PANELS ---
 f1, f2 = st.columns(2)
@@ -386,5 +448,6 @@ with st.expander("Why this score? (Factor Breakdown)", expanded=True):
         st.markdown(n)
 
 zg_val = f"{spx['zero_gamma']:.1f}" if spx["zero_gamma"] else "N/A"
+or_str = f" | OR High: {es['or_high']:.2f} | OR Low: {es['or_low']:.2f}" if es else ""
 st.subheader("Quick-Copy Levels for TradingView")
-st.code(f"Put Wall: {spx['put_wall'][0]:.0f} | King: {spx['king'][0]:.0f} | Call Wall: {spx['call_wall'][0]:.0f} | Zero Gamma: {zg_val}", language="text")
+st.code(f"Put Wall: {spx['put_wall'][0]:.0f} | King: {spx['king'][0]:.0f} | Call Wall: {spx['call_wall'][0]:.0f} | Zero Gamma: {zg_val}{or_str}", language="text")
