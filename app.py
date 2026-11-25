@@ -38,13 +38,11 @@ def fetch_es_data():
         if df.empty or len(df) < 15:
             return None
 
-        # Convert index to New York time (ET)
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC").tz_convert("America/New_York")
         else:
             df.index = df.index.tz_convert("America/New_York")
 
-        # Use latest calendar date in feed for session CVD
         latest_day = df.index[-1].date()
         day_df = df[df.index.date == latest_day].copy()
         if len(day_df) < 15:
@@ -72,7 +70,6 @@ def fetch_es_data():
         else:
             absorb = "BALANCED / CHOP"
 
-        # 9:30 - 9:44 AM ET Opening Range (15-min window)
         or_bars = day_df.between_time("09:30", "09:44")
         if len(or_bars) >= 10:
             or_high = float(or_bars["High"].max())
@@ -80,7 +77,6 @@ def fetch_es_data():
             or_mid = (or_high + or_low) / 2.0
             or_ready = True
         else:
-            # Pre-market fallback: Overnight High / Low
             or_high = float(day_df["High"].max())
             or_low = float(day_df["Low"].min())
             or_mid = (or_high + or_low) / 2.0
@@ -447,7 +443,13 @@ with st.expander("Why this score? (Factor Breakdown)", expanded=True):
     for n in notes:
         st.markdown(n)
 
-zg_val = f"{spx['zero_gamma']:.1f}" if spx["zero_gamma"] else "N/A"
-or_str = f" | OR High: {es['or_high']:.2f} | OR Low: {es['or_low']:.2f}" if es else ""
-st.subheader("Quick-Copy Levels for TradingView")
-st.code(f"Put Wall: {spx['put_wall'][0]:.0f} | King: {spx['king'][0]:.0f} | Call Wall: {spx['call_wall'][0]:.0f} | Zero Gamma: {zg_val}{or_str}", language="text")
+# --- 1-PASTE TRADINGVIEW STRING (INCLUDES ES-SPX BASIS) ---
+zg_num = f"{spx['zero_gamma']:.1f}" if spx["zero_gamma"] else "0"
+basis_val = round(es["es_last"] - spx["spot"], 2) if es else 0.0
+tv_string = f"{spx['put_wall'][0]:.0f},{spx['king'][0]:.0f},{spx['call_wall'][0]:.0f},{zg_num},{basis_val:.2f}"
+
+st.subheader("1-Paste String for TradingView Indicator")
+st.code(tv_string, language="text")
+st.caption(f"Format: Put Wall, King, Call Wall, Zero Γ, ES–SPX Basis (`{basis_val:+.2f}` pts)")
+
+
