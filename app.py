@@ -449,7 +449,7 @@ basis_val = round(es["es_last"] - spx["spot"], 2) if es else 0.0
 tv_string = f"{spx['put_wall'][0]:.0f},{spx['king'][0]:.0f},{spx['call_wall'][0]:.0f},{zg_num},{basis_val:.2f}"
 
 st.subheader("1-Paste String for TradingView Indicator")
-st.code(tv_string, language="text")
+st.text_input("Tap, Select All, and Copy:", value=tv_string, label_visibility="collapsed")
 st.caption(f"Format: Put Wall, King, Call Wall, Zero Γ, ES–SPX Basis (`{basis_val:+.2f}` pts)")
 
 
