@@ -91,6 +91,7 @@ def analyze_chain(chain, scope="All Exp"):
     put_wall = min(put_k, key=put_k.get)
     king = max(net_k, key=lambda x: abs(net_k[x]))
 
+    # True Spot-Shift Zero Gamma (±6%)
     grid = np.linspace(spot * 0.94, spot * 1.06, 51)
     totals = np.array([(sign * bs_greeks(s, K, T, sigma)[0] * OI * 100.0 * (s**2) * 0.01).sum() for s in grid])
     cross = np.where(np.diff(np.sign(totals)) != 0)[0]
@@ -106,86 +107,194 @@ def analyze_chain(chain, scope="All Exp"):
         "zero_gamma": zero_gamma, "net_k": net_k, "vol_oi_k": vol_oi_k,
     }
 
-# --- UI ---
-st.title("SPX Multi-Factor GEX Command Center")
-col_a, col_b = st.columns([2, 1])
-scope = col_a.radio("Expiration Scope", ["All Exp", "0DTE"], horizontal=True)
-if col_b.button("Refresh Data Now"):
+def build_roadmap(spx, score):
+    """Finds what is directly above and below spot, and what comes next if it breaks."""
+    spot = spx["spot"]
+    key_levels = [
+        (spx["put_wall"][0], "Put Wall", spx["put_wall"][1]),
+        (spx["king"][0], "King Node", spx["king"][1]),
+        (spx["call_wall"][0], "Call Wall", spx["call_wall"][1]),
+    ]
+    if spx["zero_gamma"]:
+        key_levels.append((round(spx["zero_gamma"], 1), "Zero Γ Flip", 0.0))
+
+    # Deduplicate close levels and sort
+    above = sorted([lvl for lvl in key_levels if lvl[0] > spot + 2], key=lambda x: x[0])
+    below = sorted([lvl for lvl in key_levels if lvl[0] < spot - 2], key=lambda x: x[0], reverse=True)
+
+    # Upside verdict
+    if above:
+        up1 = above[0]
+        up_next = f"{above[1][1]} ({above[1][0]:.0f})" if len(above) > 1 else f"Open Air (+{spot*0.01:.0f} pts)"
+        voi = spx["vol_oi_k"].get(round(up1[0]), 0)
+        if score >= 2 or (up1[2] < 0 and score >= 1) or voi >= 2.0:
+            up_status = "LIKELY TO BREAK"
+            up_reason = "VIX/Vanna tailwind or heavy intraday flow is pushing into this level."
+        elif up1[2] > 0 and score <= 0:
+            up_status = "LIKELY TO HOLD (CEILING)"
+            up_reason = "Positive dealer gamma here should absorb buying unless VIX drops sharply."
+        else:
+            up_status = "CONTESTED / WATCH TAPE"
+            up_reason = "Wait for a clean 5m ES close above + falling VIX before chasing."
+    else:
+        up1, up_next, up_status, up_reason = None, "Blue Sky", "ABOVE ALL WALLS", "Spot is above the Call Wall — squeeze territory."
+
+    # Downside verdict
+    if below:
+        dn1 = below[0]
+        dn_next = f"{below[1][1]} ({below[1][0]:.0f})" if len(below) > 1 else f"Open Air (-{spot*0.01:.0f} pts)"
+        if score <= -2:
+            dn_status = "AT RISK OF BREAKING"
+            dn_reason = "Rising VIX + negative dealer flow is pressuring this floor."
+        elif score >= 1:
+            dn_status = "LIKELY TO HOLD (FLOOR)"
+            dn_reason = "Volatility is calm/falling; dips into this level should find buyers."
+        else:
+            dn_status = "CONTESTED / WATCH TAPE"
+            dn_reason = "Watch if VIX spikes on a test; a break accelerates selling."
+    else:
+        dn1, dn_next, dn_status, dn_reason = None, "Air Pocket", "BELOW ALL WALLS", "Spot is below the Put Wall — high crash/acceleration risk."
+
+    return (up1, up_next, up_status, up_reason), (dn1, dn_next, dn_status, dn_reason)
+
+# --- HEADER ---
+st.title("SPX GEX Command Center")
+c1, c2 = st.columns([2, 1])
+scope = c1.radio("Expiration Scope", ["All Exp", "0DTE"], horizontal=True)
+if c2.button("Refresh Live Data"):
     st.cache_data.clear()
 
-with st.spinner("Fetching Cboe chains & volatility..."):
+with st.spinner("Loading Cboe options chains & volatility..."):
     spx = analyze_chain(fetch_json(URLS["SPX"]), scope=scope)
     qqq = analyze_chain(fetch_json(URLS["QQQ"]), scope="All Exp")
     vix = fetch_json(URLS["VIX"])
     vix1d = fetch_json(URLS["VIX1D"])
 
 if not spx:
-    st.warning("No contracts found for 0DTE (market may be closed or weekend). Switch to All Exp.")
+    st.warning("No 0DTE contracts active right now (market closed or weekend). Switch to All Exp.")
     st.stop()
 
 vix_px, vix_chg = float(vix.get("current_price", 0)), float(vix.get("price_change", 0))
 v1d_px, v1d_chg = float(vix1d.get("current_price", 0)), float(vix1d.get("price_change", 0))
 v_ratio = v1d_px / vix_px if vix_px > 0 else 1.0
 
-# --- CONFLUENCE SCORE ---
+# --- CONFLUENCE ENGINE ---
 score, notes = 0, []
 if spx["net_vex"] > 0 and vix_chg < -0.2:
     score += 2
-    notes.append("VIX bleeding lower: Positive VEX is forcing dealer buying.")
+    notes.append("🟢 **VIX Falling:** Positive VEX is forcing dealers to buy futures.")
 elif spx["net_vex"] > 0 and vix_chg > 0.2:
     score -= 2
-    notes.append("VIX curling up: Positive VEX flips to dealer selling.")
+    notes.append("🔴 **VIX Rising:** Positive VEX flips to dealer selling pressure.")
 else:
-    notes.append("VIX flat: No strong Vanna tailwind yet.")
+    notes.append("⚪ **VIX Flat:** No strong Vanna push either way yet.")
 
 if v_ratio < 0.95:
     score += 1
-    notes.append(f"VIX1D/VIX ({v_ratio:.2f}) < 0.95: Same-day fear is draining.")
+    notes.append(f"🟢 **VIX1D/VIX ({v_ratio:.2f}):** Same-day fear is draining (bullish).")
 elif v_ratio > 1.05:
     score -= 1
-    notes.append(f"VIX1D/VIX ({v_ratio:.2f}) > 1.05: Traders paying up for 0DTE protection.")
+    notes.append(f"🔴 **VIX1D/VIX ({v_ratio:.2f}):** Traders paying up for 0DTE protection (bearish).")
 
 if spx["charm_es_hr"] > 0:
     score += 1
-    notes.append(f"Charm positive (+{spx['charm_es_hr']:.0f} ES/hr): Time decay supports upside drift.")
+    notes.append(f"🟢 **Charm (+{spx['charm_es_hr']:.0f} ES/hr):** Time decay supports upside drift.")
 else:
     score -= 1
-    notes.append(f"Charm negative ({spx['charm_es_hr']:.0f} ES/hr): Time decay leans bearish.")
+    notes.append(f"🔴 **Charm ({spx['charm_es_hr']:.0f} ES/hr):** Time decay leans bearish.")
 
 if qqq and qqq["spot"] >= qqq["king"][0]:
     score += 1
-    notes.append(f"QQQ ({qqq['spot']:.2f}) holding above its King ({qqq['king'][0]:.0f}): Tech confirming.")
+    notes.append(f"🟢 **QQQ ({qqq['spot']:.2f}):** Above its King ({qqq['king'][0]:.0f}) — tech confirming.")
 elif qqq:
     score -= 1
-    notes.append(f"QQQ ({qqq['spot']:.2f}) below its King ({qqq['king'][0]:.0f}): Tech lagging.")
+    notes.append(f"🔴 **QQQ ({qqq['spot']:.2f}):** Below its King ({qqq['king'][0]:.0f}) — tech lagging.")
 
-# --- METRICS ---
+# --- TOP VERDICT BANNER ---
+regime_txt = "POSITIVE GAMMA (Choppy / Mean-Reverting)" if spx["net_gex"] >= 0 else "NEGATIVE GAMMA (Fast / Trending)"
+if score >= 2:
+    st.success(f"**BULLISH BIAS ({score:+d}/5) — {regime_txt}** | Tailwinds are active. Favor breakouts above resistance and dip-buys.")
+elif score <= -2:
+    st.error(f"**BEARISH BIAS ({score:+d}/5) — {regime_txt}** | Selling pressure active. Rallies into walls are likely to reject.")
+else:
+    st.warning(f"**MIXED / NEUTRAL ({score:+d}/5) — {regime_txt}** | No clear vol tailwind yet. Let price test a key level and confirm with TradingView ES CVD & $TICK.")
+
+# --- WHAT'S NEXT IN LINE (UPSIDE vs DOWNSIDE) ---
+(up1, up_next, up_status, up_reason), (dn1, dn_next, dn_status, dn_reason) = build_roadmap(spx, score)
+
+r1, r2 = st.columns(2)
+with r1:
+    with st.container(border=True):
+        st.markdown("### ⬆️ Next Upside Test")
+        if up1:
+            dist = up1[0] - spx["spot"]
+            st.markdown(f"**{up1[1]} at `{up1[0]:.0f}`** (+{dist:.1f} pts away)")
+            st.markdown(f"**Verdict:** `{up_status}`")
+            st.caption(up_reason)
+            st.markdown(f"**If it breaks → Next in line:** `{up_next}`")
+        else:
+            st.markdown(f"**{up_status}** — {up_reason}")
+
+with r2:
+    with st.container(border=True):
+        st.markdown("### ⬇️ Next Downside Test")
+        if dn1:
+            dist = spx["spot"] - dn1[0]
+            st.markdown(f"**{dn1[1]} at `{dn1[0]:.0f}`** (-{dist:.1f} pts away)")
+            st.markdown(f"**Verdict:** `{dn_status}`")
+            st.caption(dn_reason)
+            st.markdown(f"**If it breaks → Next in line:** `{dn_next}`")
+        else:
+            st.markdown(f"**{dn_status}** — {dn_reason}")
+
+# --- KEY METRICS ---
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("SPX Spot", f"{spx['spot']:.2f}", f"Zero Γ: {spx['zero_gamma']:.1f}" if spx["zero_gamma"] else "Zero Γ: N/A")
-m2.metric("Net GEX", f"${spx['net_gex']:+.2f}B", "Positive (Chop)" if spx["net_gex"] >= 0 else "Negative (Trend)")
+m1.metric("SPX Spot", f"{spx['spot']:.2f}", f"Zero Γ: {spx['zero_gamma']:.1f}" if spx["zero_gamma"] else "Zero Γ: Out of range")
+m2.metric("Net GEX", f"${spx['net_gex']:+.2f}B", "Chop" if spx["net_gex"] >= 0 else "Trend")
 m3.metric("Net VEX", f"${spx['net_vex']:+.2f}B", f"VIX {vix_px:.2f} ({vix_chg:+.2f})")
-m4.metric("Confluence Score", f"{score:+d} / 5", "Bullish Push" if score >= 2 else ("Bearish / Reject" if score <= -2 else "Mixed / Wait"))
+m4.metric("VIX1D / VIX", f"{v_ratio:.2f}", f"VIX1D {v1d_px:.2f} ({v1d_chg:+.2f})")
 
-l1, l2, l3, l4 = st.columns(4)
-l1.metric("Put Wall", f"{spx['put_wall'][0]:.0f}", f"${spx['put_wall'][1]:+.2f}B")
-l2.metric("King Node", f"{spx['king'][0]:.0f}", f"${spx['king'][1]:+.2f}B")
-l3.metric("Call Wall", f"{spx['call_wall'][0]:.0f}", f"${spx['call_wall'][1]:+.2f}B")
-l4.metric("VIX1D / VIX", f"{v_ratio:.2f}", f"VIX1D {v1d_px:.2f} ({v1d_chg:+.2f})")
-
-st.subheader("Live Playbook Readout")
-for n in notes:
-    st.markdown(f"- {n}")
-
-# --- STRIKE CHART (±2.5% around spot) ---
+# --- ANNOTATED GAMMA PROFILE CHART ---
 near = sorted([k for k in spx["net_k"] if abs(k - spx["spot"]) / spx["spot"] <= 0.025])
 vals = [spx["net_k"][k] / 1e6 for k in near]
-colors = ["#00c853" if v >= 0 else "#ff5252" for v in vals]
+colors = ["#00e676" if v >= 0 else "#ff5252" for v in vals]
 
-fig = go.Figure(go.Bar(x=vals, y=[str(int(k)) for k in near], orientation="h", marker_color=colors))
+fig = go.Figure(go.Bar(x=vals, y=near, orientation="h", marker_color=colors, name="Net GEX ($M)"))
+
+# Draw Key Horizontal Levels
+fig.add_hline(y=spx["spot"], line_dash="dash", line_color="white", line_width=2,
+              annotation_text=f"SPOT {spx['spot']:.1f}", annotation_position="top right")
+if min(near) <= spx["call_wall"][0] <= max(near):
+    fig.add_hline(y=spx["call_wall"][0], line_dash="dot", line_color="#00e5ff",
+                  annotation_text=f"CALL WALL {spx['call_wall'][0]:.0f}", annotation_position="top left")
+if min(near) <= spx["put_wall"][0] <= max(near):
+    fig.add_hline(y=spx["put_wall"][0], line_dash="dot", line_color="#ff4081",
+                  annotation_text=f"PUT WALL {spx['put_wall'][0]:.0f}", annotation_position="bottom left")
+if min(near) <= spx["king"][0] <= max(near):
+    fig.add_hline(y=spx["king"][0], line_dash="solid", line_color="#ffd740", line_width=1.5,
+                  annotation_text=f"KING {spx['king'][0]:.0f}", annotation_position="bottom right")
+if spx["zero_gamma"] and min(near) <= spx["zero_gamma"] <= max(near):
+    fig.add_hline(y=spx["zero_gamma"], line_dash="dashdot", line_color="#ff9100",
+                  annotation_text=f"ZERO Γ {spx['zero_gamma']:.1f}", annotation_position="top left")
+
 fig.update_layout(
-    title="Net GEX by Strike ($M) — ±2.5% Around Spot",
-    xaxis_title="Net GEX ($ Millions)", yaxis_title="Strike",
-    height=520, template="plotly_dark", margin=dict(l=20, r=20, t=40, b=20)
+    title=f"SPX {scope} Gamma Map (±2.5% Around Spot)",
+    xaxis_title="Net GEX ($ Millions) — Green = Pin/Support/Ceiling | Red = Volatile/Accelerator",
+    yaxis_title="Strike Price",
+    height=560, template="plotly_dark", margin=dict(l=15, r=15, t=45, b=20),
+    showlegend=False
 )
 st.plotly_chart(fig, use_container_width=True)
-st.caption(f"Last refreshed: {datetime.now().strftime('%H:%M:%S')} | Cboe 15-min delayed feed | Confirm final entries with ES CVD & NYSE $TICK on TradingView.")
+
+# --- FACTOR BREAKDOWN & TRADINGVIEW COPY BOX ---
+with st.expander("Why this score? (Factor Breakdown)", expanded=True):
+    for n in notes:
+        st.markdown(n)
+
+zg_val = f"{spx['zero_gamma']:.1f}" if spx["zero_gamma"] else "N/A"
+st.subheader("Quick-Copy Levels for TradingView")
+st.code(
+    f"Put Wall: {spx['put_wall'][0]:.0f} | King: {spx['king'][0]:.0f} | Call Wall: {spx['call_wall'][0]:.0f} | Zero Gamma: {zg_val}",
+    language="text"
+)
+st.caption(f"Refreshed: {datetime.now().strftime('%H:%M:%S')} | Cboe 15-min delayed data | Confirm final entries with live ES CVD & NYSE $TICK on TradingView.")
