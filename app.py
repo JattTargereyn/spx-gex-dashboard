@@ -1,13 +1,17 @@
 import re
-import requests
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
 from datetime import datetime, date
+from curl_cffi import requests as cffi_requests
 
 st.set_page_config(page_title="SPX GEX Command Center", layout="wide")
 
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.cboe.com/",
+    "Origin": "https://www.cboe.com",
+}
 OCC_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
 URLS = {
     "SPX": "https://cdn.cboe.com/api/global/delayed_quotes/options/_SPX.json",
@@ -18,11 +22,11 @@ URLS = {
 
 @st.cache_data(ttl=300)
 def fetch_json(url):
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    r.raise_for_status()
+    r = cffi_requests.get(url, headers=HEADERS, impersonate="chrome", timeout=30)
+    if r.status_code != 200:
+        st.error(f"Cboe returned HTTP {r.status_code} for {url}")
+        st.stop()
     return r.json()["data"]
-
-def bs_greeks(S, K, T, sigma, r=0.04):
     T = np.maximum(T, 10.0 / (252.0 * 390.0))
     sqrt_T = np.sqrt(T)
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
