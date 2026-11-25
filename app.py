@@ -443,13 +443,33 @@ with st.expander("Why this score? (Factor Breakdown)", expanded=True):
     for n in notes:
         st.markdown(n)
 
-# --- 1-PASTE TRADINGVIEW STRING (INCLUDES ES-SPX BASIS) ---
+# --- 1-PASTE TRADINGVIEW STRING (WALLS + BASIS + NEXT TARGETS) ---
+key_lvls = [spx["put_wall"][0], spx["king"][0], spx["call_wall"][0]]
+if spx["zero_gamma"]:
+    key_lvls.append(round(spx["zero_gamma"], 1))
+
+above_lvls = sorted([x for x in key_lvls if x > spx["spot"] + 2])
+below_lvls = sorted([x for x in key_lvls if x < spx["spot"] - 2], reverse=True)
+
+if len(above_lvls) >= 2:
+    up_tgt = above_lvls[1]
+elif len(above_lvls) == 1:
+    up_tgt = round((above_lvls[0] + spx["spot"] * 0.0075) / 5.0) * 5.0
+else:
+    up_tgt = round((spx["spot"] * 1.01) / 5.0) * 5.0
+
+if len(below_lvls) >= 2:
+    dn_tgt = below_lvls[1]
+elif len(below_lvls) == 1:
+    dn_tgt = round((below_lvls[0] - spx["spot"] * 0.0075) / 5.0) * 5.0
+else:
+    dn_tgt = round((spx["spot"] * 0.99) / 5.0) * 5.0
+
 zg_num = f"{spx['zero_gamma']:.1f}" if spx["zero_gamma"] else "0"
 basis_val = round(es["es_last"] - spx["spot"], 2) if es else 0.0
-tv_string = f"{spx['put_wall'][0]:.0f},{spx['king'][0]:.0f},{spx['call_wall'][0]:.0f},{zg_num},{basis_val:.2f}"
+tv_string = f"{spx['put_wall'][0]:.0f},{spx['king'][0]:.0f},{spx['call_wall'][0]:.0f},{zg_num},{basis_val:.2f},{up_tgt:.0f},{dn_tgt:.0f}"
 
 st.subheader("1-Paste String for TradingView Indicator")
 st.text_input("Tap, Select All, and Copy:", value=tv_string, label_visibility="collapsed")
-st.caption(f"Format: Put Wall, King, Call Wall, Zero Γ, ES–SPX Basis (`{basis_val:+.2f}` pts)")
-
+st.caption(f"Format: Put, King, Call, Zero Γ, Basis (`{basis_val:+.2f}`), Up Target (`{up_tgt:.0f}`), Dn Target (`{dn_tgt:.0f}`)")
 
