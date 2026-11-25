@@ -91,6 +91,25 @@ def fetch_es_data():
     except Exception:
         return None
 
+@st.cache_data(ttl=300)
+def fetch_matched_basis():
+    """Calculates ES-SPX basis using exact same-minute overlapping bars (eliminates delay mismatch)."""
+    try:
+        es_df = yf.Ticker("ES=F").history(period="2d", interval="1m")["Close"]
+        spx_df = yf.Ticker("^GSPC").history(period="2d", interval="1m")["Close"]
+        if es_df.empty or spx_df.empty:
+            return None
+
+        es_df.index = es_df.index.tz_localize("UTC") if es_df.index.tz is None else es_df.index.tz_convert("UTC")
+        spx_df.index = spx_df.index.tz_localize("UTC") if spx_df.index.tz is None else spx_df.index.tz_convert("UTC")
+
+        joined = es_df.to_frame("es").join(spx_df.to_frame("spx"), how="inner").dropna()
+        if not joined.empty:
+            return round(float((joined["es"] - joined["spx"]).tail(5).median()), 2)
+    except Exception:
+        pass
+    return None
+
 def bs_greeks(S, K, T, sigma, r=0.04):
     T = np.maximum(T, 10.0 / (252.0 * 390.0))
     sqrt_T = np.sqrt(T)
@@ -262,6 +281,7 @@ with st.spinner("Loading Cboe chains, 0DTE flow, VIX & ES Opening Range..."):
     spx = analyze_chain(spx_raw, scope=scope)
     qqq = analyze_chain(qqq_raw, scope="All Exp")
     es = fetch_es_data()
+    matched_basis = fetch_matched_basis()
 
 st.info(f"**Data Timestamp:** Cboe Chain `{format_age(spx_ts)}` | ES Futures: `{es['es_time'] if es else 'Unavailable'}` | Page Refreshed: `{datetime.now().strftime('%H:%M:%S')}`")
 
@@ -443,7 +463,7 @@ with st.expander("Why this score? (Factor Breakdown)", expanded=True):
     for n in notes:
         st.markdown(n)
 
-# --- 1-PASTE TRADINGVIEW STRING (WALLS + BASIS + NEXT TARGETS) ---
+# --- 1-PASTE TRADINGVIEW STRING (WALLS + MATCHED BASIS + NEXT TARGETS) ---
 key_lvls = [spx["put_wall"][0], spx["king"][0], spx["call_wall"][0]]
 if spx["zero_gamma"]:
     key_lvls.append(round(spx["zero_gamma"], 1))
@@ -466,10 +486,10 @@ else:
     dn_tgt = round((spx["spot"] * 0.99) / 5.0) * 5.0
 
 zg_num = f"{spx['zero_gamma']:.1f}" if spx["zero_gamma"] else "0"
-basis_val = round(es["es_last"] - spx["spot"], 2) if es else 0.0
+basis_val = matched_basis if matched_basis is not None else (round(es["es_last"] - spx["spot"], 2) if es else 0.0)
 tv_string = f"{spx['put_wall'][0]:.0f},{spx['king'][0]:.0f},{spx['call_wall'][0]:.0f},{zg_num},{basis_val:.2f},{up_tgt:.0f},{dn_tgt:.0f}"
 
 st.subheader("1-Paste String for TradingView Indicator")
 st.text_input("Tap, Select All, and Copy:", value=tv_string, label_visibility="collapsed")
-st.caption(f"Format: Put, King, Call, Zero Γ, Basis (`{basis_val:+.2f}`), Up Target (`{up_tgt:.0f}`), Dn Target (`{dn_tgt:.0f}`)")
+st.caption(f"Format: Put, King, Call, Zero Γ, Matched Basis (`{basis_val:+.2f}`), Up Target (`{up_tgt:.0f}`), Dn Target (`{dn_tgt:.0f}`)")
 
