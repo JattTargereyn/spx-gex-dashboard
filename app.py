@@ -2,7 +2,8 @@ import re
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
-from datetime import datetime, date
+import yfinance as yf
+from datetime import datetime, date, timezone
 from curl_cffi import requests as cffi_requests
 
 st.set_page_config(page_title="SPX GEX Command Center", layout="wide")
@@ -20,13 +21,52 @@ URLS = {
     "VIX1D": "https://cdn.cboe.com/api/global/delayed_quotes/quotes/_VIX1D.json",
 }
 
-@st.cache_data(ttl=300)
-def fetch_json(url):
+@st.cache_data(ttl=180)
+def fetch_cboe(url):
     r = cffi_requests.get(url, headers=HEADERS, impersonate="chrome", timeout=30)
     if r.status_code != 200:
         st.error(f"Cboe returned HTTP {r.status_code} for {url}")
         st.stop()
-    return r.json()["data"]
+    raw = r.json()
+    return raw["data"], raw.get("timestamp", "Unknown")
+
+@st.cache_data(ttl=120)
+def fetch_es_cvd():
+    """Estimates ES session CVD & 15m absorption from 1m ES=F bars."""
+    try:
+        df = yf.Ticker("ES=F").history(period="1d", interval="1m")
+        if df.empty or len(df) < 15:
+            return None
+        rng = (df["High"] - df["Low"]).replace(0, np.nan)
+        buy_ratio = ((df["Close"] - df["Low"]) / rng).fillna(0.5).clip(0, 1)
+        df["delta"] = df["Volume"] * (2.0 * buy_ratio - 1.0)
+        df["cvd"] = df["delta"].cumsum()
+
+        last_15 = df.tail(15)
+        cvd_15m = float(last_15["delta"].sum())
+        vol_15m = float(last_15["Volume"].sum())
+        px_chg_15m = float(last_15["Close"].iloc[-1] - last_15["Close"].iloc[0])
+        es_last = float(df["Close"].iloc[-1])
+        es_time = df.index[-1].strftime("%H:%M %Z")
+
+        # Absorption check: strong 15m directional CVD (>25% of 15m vol) but price stalled (<2.5 pts)
+        delta_pct = abs(cvd_15m) / max(vol_15m, 1.0)
+        if delta_pct > 0.22 and abs(px_chg_15m) < 2.5:
+            absorb = "BUYER ABSORPTION (Ceiling)" if cvd_15m > 0 else "SELLER ABSORPTION (Floor)"
+        elif cvd_15m > 0 and px_chg_15m > 2.5:
+            absorb = "CLEAN BUYING PUSH"
+        elif cvd_15m < 0 and px_chg_15m < -2.5:
+            absorb = "CLEAN SELLING PUSH"
+        else:
+            absorb = "BALANCED / CHOP"
+
+        return {
+            "es_last": es_last, "es_time": es_time,
+            "cvd_sess": float(df["cvd"].iloc[-1]), "cvd_15m": cvd_15m,
+            "px_chg_15m": px_chg_15m, "absorb": absorb,
+        }
+    except Exception:
+        return None
 
 def bs_greeks(S, K, T, sigma, r=0.04):
     T = np.maximum(T, 10.0 / (252.0 * 390.0))
@@ -44,20 +84,36 @@ def analyze_chain(chain, scope="All Exp"):
     today = date.today()
     strikes, Ts, ivs, ois, vols, signs = [], [], [], [], [], []
 
+    # Track 0DTE flow separately regardless of scope
+    dte0_call_vol, dte0_put_vol = 0.0, 0.0
+    dte0_strikes = {}
+
     for opt in chain["options"]:
         m = OCC_RE.match(opt["option"])
         if not m:
             continue
         oi = opt.get("open_interest") or 0
         iv = opt.get("iv") or 0
-        if oi <= 0 or iv <= 0.01:
-            continue
+        vol = float(opt.get("volume") or 0)
         ymd = m.group(2)
         exp = date(2000 + int(ymd[:2]), int(ymd[2:4]), int(ymd[4:6]))
         dte = max((exp - today).days, 0)
+        strike = int(m.group(4)) / 1000.0
+        is_call = m.group(3) == "C"
+
+        if dte == 0 and abs(strike - spot) / spot <= 0.05:
+            if is_call:
+                dte0_call_vol += vol
+            else:
+                dte0_put_vol += vol
+            rec = dte0_strikes.setdefault(strike, {"c_vol": 0.0, "p_vol": 0.0, "oi": 0.0})
+            rec["c_vol" if is_call else "p_vol"] += vol
+            rec["oi"] += float(oi)
+
+        if oi <= 0 or iv <= 0.01:
+            continue
         if scope == "0DTE" and dte > 0:
             continue
-        strike = int(m.group(4)) / 1000.0
         if abs(strike - spot) / spot > 0.20:
             continue
 
@@ -65,8 +121,8 @@ def analyze_chain(chain, scope="All Exp"):
         Ts.append(dte / 365.0)
         ivs.append(float(iv))
         ois.append(float(oi))
-        vols.append(float(opt.get("volume") or 0))
-        signs.append(1.0 if m.group(3) == "C" else -1.0)
+        vols.append(vol)
+        signs.append(1.0 if is_call else -1.0)
 
     if not strikes:
         return None
@@ -91,7 +147,6 @@ def analyze_chain(chain, scope="All Exp"):
     put_wall = min(put_k, key=put_k.get)
     king = max(net_k, key=lambda x: abs(net_k[x]))
 
-    # True Spot-Shift Zero Gamma (±6%)
     grid = np.linspace(spot * 0.94, spot * 1.06, 51)
     totals = np.array([(sign * bs_greeks(s, K, T, sigma)[0] * OI * 100.0 * (s**2) * 0.01).sum() for s in grid])
     cross = np.where(np.diff(np.sign(totals)) != 0)[0]
@@ -100,15 +155,33 @@ def analyze_chain(chain, scope="All Exp"):
         i = cross[0]
         zero_gamma = grid[i] - totals[i] * (grid[i + 1] - grid[i]) / (totals[i + 1] - totals[i])
 
+    # Top 0DTE hot strikes
+    hot_0dte = sorted(
+        [(k, v["c_vol"] + v["p_vol"], (v["c_vol"] + v["p_vol"]) / max(v["oi"], 1.0),
+          "CALLS" if v["c_vol"] >= v["p_vol"] else "PUTS")
+         for k, v in dte0_strikes.items()],
+        key=lambda x: x[1], reverse=True
+    )[:3]
+
     return {
         "spot": spot, "net_gex": gex.sum() / 1e9, "net_vex": vex.sum() / 1e9,
         "charm_es_hr": charm_es_hr, "call_wall": (call_wall, call_k[call_wall] / 1e9),
         "put_wall": (put_wall, put_k[put_wall] / 1e9), "king": (king, net_k[king] / 1e9),
         "zero_gamma": zero_gamma, "net_k": net_k, "vol_oi_k": vol_oi_k,
+        "dte0_cvol": dte0_call_vol, "dte0_pvol": dte0_put_vol, "hot_0dte": hot_0dte,
     }
 
+def format_age(ts_str):
+    try:
+        dt = datetime.strptime(ts_str[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        mins = int((datetime.now(timezone.utc) - dt).total_seconds() // 60)
+        if mins < 60:
+            return f"{ts_str} UTC ({mins}m old)"
+        return f"{ts_str} UTC ({mins // 60}h {mins % 60}m old — Market Closed/Stale)"
+    except Exception:
+        return f"{ts_str}"
+
 def build_roadmap(spx, score):
-    """Finds what is directly above and below spot, and what comes next if it breaks."""
     spot = spx["spot"]
     key_levels = [
         (spx["put_wall"][0], "Put Wall", spx["put_wall"][1]),
@@ -118,28 +191,25 @@ def build_roadmap(spx, score):
     if spx["zero_gamma"]:
         key_levels.append((round(spx["zero_gamma"], 1), "Zero Γ Flip", 0.0))
 
-    # Deduplicate close levels and sort
     above = sorted([lvl for lvl in key_levels if lvl[0] > spot + 2], key=lambda x: x[0])
     below = sorted([lvl for lvl in key_levels if lvl[0] < spot - 2], key=lambda x: x[0], reverse=True)
 
-    # Upside verdict
     if above:
         up1 = above[0]
         up_next = f"{above[1][1]} ({above[1][0]:.0f})" if len(above) > 1 else f"Open Air (+{spot*0.01:.0f} pts)"
         voi = spx["vol_oi_k"].get(round(up1[0]), 0)
         if score >= 2 or (up1[2] < 0 and score >= 1) or voi >= 2.0:
             up_status = "LIKELY TO BREAK"
-            up_reason = "VIX/Vanna tailwind or heavy intraday flow is pushing into this level."
+            up_reason = "Vanna/0DTE flow or heavy intraday Vol/OI is pressuring this level."
         elif up1[2] > 0 and score <= 0:
             up_status = "LIKELY TO HOLD (CEILING)"
-            up_reason = "Positive dealer gamma here should absorb buying unless VIX drops sharply."
+            up_reason = "Positive dealer gamma should absorb buying unless VIX drops."
         else:
             up_status = "CONTESTED / WATCH TAPE"
-            up_reason = "Wait for a clean 5m ES close above + falling VIX before chasing."
+            up_reason = "Wait for clean 5m ES close above + falling VIX."
     else:
-        up1, up_next, up_status, up_reason = None, "Blue Sky", "ABOVE ALL WALLS", "Spot is above the Call Wall — squeeze territory."
+        up1, up_next, up_status, up_reason = None, "Blue Sky", "ABOVE ALL WALLS", "Squeeze territory."
 
-    # Downside verdict
     if below:
         dn1 = below[0]
         dn_next = f"{below[1][1]} ({below[1][0]:.0f})" if len(below) > 1 else f"Open Air (-{spot*0.01:.0f} pts)"
@@ -148,27 +218,32 @@ def build_roadmap(spx, score):
             dn_reason = "Rising VIX + negative dealer flow is pressuring this floor."
         elif score >= 1:
             dn_status = "LIKELY TO HOLD (FLOOR)"
-            dn_reason = "Volatility is calm/falling; dips into this level should find buyers."
+            dn_reason = "Calm/falling vol; dips into this level should find buyers."
         else:
             dn_status = "CONTESTED / WATCH TAPE"
             dn_reason = "Watch if VIX spikes on a test; a break accelerates selling."
     else:
-        dn1, dn_next, dn_status, dn_reason = None, "Air Pocket", "BELOW ALL WALLS", "Spot is below the Put Wall — high crash/acceleration risk."
+        dn1, dn_next, dn_status, dn_reason = None, "Air Pocket", "BELOW ALL WALLS", "High acceleration risk."
 
     return (up1, up_next, up_status, up_reason), (dn1, dn_next, dn_status, dn_reason)
 
-# --- HEADER ---
+# --- HEADER & FRESHNESS ---
 st.title("SPX GEX Command Center")
 c1, c2 = st.columns([2, 1])
 scope = c1.radio("Expiration Scope", ["All Exp", "0DTE"], horizontal=True)
 if c2.button("Refresh Live Data"):
     st.cache_data.clear()
 
-with st.spinner("Loading Cboe options chains & volatility..."):
-    spx = analyze_chain(fetch_json(URLS["SPX"]), scope=scope)
-    qqq = analyze_chain(fetch_json(URLS["QQQ"]), scope="All Exp")
-    vix = fetch_json(URLS["VIX"])
-    vix1d = fetch_json(URLS["VIX1D"])
+with st.spinner("Loading Cboe chains, 0DTE flow, VIX & ES CVD..."):
+    spx_raw, spx_ts = fetch_cboe(URLS["SPX"])
+    qqq_raw, _ = fetch_cboe(URLS["QQQ"])
+    vix, _ = fetch_cboe(URLS["VIX"])
+    vix1d, _ = fetch_cboe(URLS["VIX1D"])
+    spx = analyze_chain(spx_raw, scope=scope)
+    qqq = analyze_chain(qqq_raw, scope="All Exp")
+    es = fetch_es_cvd()
+
+st.info(f"**Data Timestamp:** Cboe Chain `{format_age(spx_ts)}` | ES Futures: `{es['es_time'] if es else 'Unavailable'}` | Page Refreshed: `{datetime.now().strftime('%H:%M:%S')}`")
 
 if not spx:
     st.warning("No 0DTE contracts active right now (market closed or weekend). Switch to All Exp.")
@@ -187,14 +262,14 @@ elif spx["net_vex"] > 0 and vix_chg > 0.2:
     score -= 2
     notes.append("🔴 **VIX Rising:** Positive VEX flips to dealer selling pressure.")
 else:
-    notes.append("⚪ **VIX Flat:** No strong Vanna push either way yet.")
+    notes.append("⚪ **VIX Flat:** No strong Vanna push yet.")
 
 if v_ratio < 0.95:
     score += 1
-    notes.append(f"🟢 **VIX1D/VIX ({v_ratio:.2f}):** Same-day fear is draining (bullish).")
+    notes.append(f"🟢 **VIX1D/VIX ({v_ratio:.2f}):** Same-day fear is draining.")
 elif v_ratio > 1.05:
     score -= 1
-    notes.append(f"🔴 **VIX1D/VIX ({v_ratio:.2f}):** Traders paying up for 0DTE protection (bearish).")
+    notes.append(f"🔴 **VIX1D/VIX ({v_ratio:.2f}):** Traders paying up for 0DTE protection.")
 
 if spx["charm_es_hr"] > 0:
     score += 1
@@ -213,25 +288,49 @@ elif qqq:
 # --- TOP VERDICT BANNER ---
 regime_txt = "POSITIVE GAMMA (Choppy / Mean-Reverting)" if spx["net_gex"] >= 0 else "NEGATIVE GAMMA (Fast / Trending)"
 if score >= 2:
-    st.success(f"**BULLISH BIAS ({score:+d}/5) — {regime_txt}** | Tailwinds are active. Favor breakouts above resistance and dip-buys.")
+    st.success(f"**BULLISH BIAS ({score:+d}/5) — {regime_txt}** | Tailwinds active. Favor breakouts & dip-buys.")
 elif score <= -2:
-    st.error(f"**BEARISH BIAS ({score:+d}/5) — {regime_txt}** | Selling pressure active. Rallies into walls are likely to reject.")
+    st.error(f"**BEARISH BIAS ({score:+d}/5) — {regime_txt}** | Selling pressure active. Rallies into walls risk rejecting.")
 else:
-    st.warning(f"**MIXED / NEUTRAL ({score:+d}/5) — {regime_txt}** | No clear vol tailwind yet. Let price test a key level and confirm with TradingView ES CVD & $TICK.")
+    st.warning(f"**MIXED / NEUTRAL ({score:+d}/5) — {regime_txt}** | Wait for a level test + ES CVD/VIX confirmation.")
 
-# --- WHAT'S NEXT IN LINE (UPSIDE vs DOWNSIDE) ---
+# --- 0DTE FLOW & ES CVD / ABSORPTION PANELS ---
+f1, f2 = st.columns(2)
+with f1:
+    with st.container(border=True):
+        st.markdown("### ⚡ 0DTE Flow & Wall Risk")
+        tot_0dte = spx["dte0_cvol"] + spx["dte0_pvol"]
+        if tot_0dte > 0:
+            c_pct = (spx["dte0_cvol"] / tot_0dte) * 100
+            st.markdown(f"**0DTE Split:** `{c_pct:.0f}% Calls` ({spx['dte0_cvol']:,.0f}) vs `{100-c_pct:.0f}% Puts` ({spx['dte0_pvol']:,.0f})")
+            for k, v, voi, side in spx["hot_0dte"]:
+                flag = " ⚠️ **WALL OVERRIDE**" if voi >= 2.0 else ""
+                st.markdown(f"- Strike `{k:.0f}` ({side}): `{v:,.0f}` vol | Vol/OI `{voi:.1f}x`{flag}")
+        else:
+            st.caption("No 0DTE volume recorded yet (pre-market or closed).")
+
+with f2:
+    with st.container(border=True):
+        st.markdown("### 📊 Est. ES CVD & Absorption (1m Bars)")
+        if es:
+            st.markdown(f"**ES Last:** `{es['es_last']:.2f}` | **15m Move:** `{es['px_chg_15m']:+.2f} pts`")
+            st.markdown(f"**Est. Session CVD:** `{es['cvd_sess']:+,.0f}` | **15m CVD:** `{es['cvd_15m']:+,.0f}`")
+            st.markdown(f"**Tape Read:** `{es['absorb']}`")
+            st.caption("Estimated from 1m bar close-in-range; confirm exact tick absorption on TradingView.")
+        else:
+            st.caption("ES=F intraday bars temporarily unavailable.")
+
+# --- WHAT'S NEXT IN LINE ---
 (up1, up_next, up_status, up_reason), (dn1, dn_next, dn_status, dn_reason) = build_roadmap(spx, score)
-
 r1, r2 = st.columns(2)
 with r1:
     with st.container(border=True):
         st.markdown("### ⬆️ Next Upside Test")
         if up1:
-            dist = up1[0] - spx["spot"]
-            st.markdown(f"**{up1[1]} at `{up1[0]:.0f}`** (+{dist:.1f} pts away)")
+            st.markdown(f"**{up1[1]} at `{up1[0]:.0f}`** (+{up1[0] - spx['spot']:.1f} pts)")
             st.markdown(f"**Verdict:** `{up_status}`")
             st.caption(up_reason)
-            st.markdown(f"**If it breaks → Next in line:** `{up_next}`")
+            st.markdown(f"**Next if it breaks:** `{up_next}`")
         else:
             st.markdown(f"**{up_status}** — {up_reason}")
 
@@ -239,11 +338,10 @@ with r2:
     with st.container(border=True):
         st.markdown("### ⬇️ Next Downside Test")
         if dn1:
-            dist = spx["spot"] - dn1[0]
-            st.markdown(f"**{dn1[1]} at `{dn1[0]:.0f}`** (-{dist:.1f} pts away)")
+            st.markdown(f"**{dn1[1]} at `{dn1[0]:.0f}`** (-{spx['spot'] - dn1[0]:.1f} pts)")
             st.markdown(f"**Verdict:** `{dn_status}`")
             st.caption(dn_reason)
-            st.markdown(f"**If it breaks → Next in line:** `{dn_next}`")
+            st.markdown(f"**Next if it breaks:** `{dn_next}`")
         else:
             st.markdown(f"**{dn_status}** — {dn_reason}")
 
@@ -259,9 +357,7 @@ near = sorted([k for k in spx["net_k"] if abs(k - spx["spot"]) / spx["spot"] <= 
 vals = [spx["net_k"][k] / 1e6 for k in near]
 colors = ["#00e676" if v >= 0 else "#ff5252" for v in vals]
 
-fig = go.Figure(go.Bar(x=vals, y=near, orientation="h", marker_color=colors, name="Net GEX ($M)"))
-
-# Draw Key Horizontal Levels
+fig = go.Figure(go.Bar(x=vals, y=near, orientation="h", marker_color=colors))
 fig.add_hline(y=spx["spot"], line_dash="dash", line_color="white", line_width=2,
               annotation_text=f"SPOT {spx['spot']:.1f}", annotation_position="top right")
 if min(near) <= spx["call_wall"][0] <= max(near):
@@ -279,22 +375,16 @@ if spx["zero_gamma"] and min(near) <= spx["zero_gamma"] <= max(near):
 
 fig.update_layout(
     title=f"SPX {scope} Gamma Map (±2.5% Around Spot)",
-    xaxis_title="Net GEX ($ Millions) — Green = Pin/Support/Ceiling | Red = Volatile/Accelerator",
-    yaxis_title="Strike Price",
-    height=560, template="plotly_dark", margin=dict(l=15, r=15, t=45, b=20),
-    showlegend=False
+    xaxis_title="Net GEX ($M) — Green = Pin/Ceiling/Support | Red = Volatile/Accelerator",
+    yaxis_title="Strike", height=540, template="plotly_dark",
+    margin=dict(l=15, r=15, t=45, b=20), showlegend=False
 )
 st.plotly_chart(fig, use_container_width=True)
 
-# --- FACTOR BREAKDOWN & TRADINGVIEW COPY BOX ---
 with st.expander("Why this score? (Factor Breakdown)", expanded=True):
     for n in notes:
         st.markdown(n)
 
 zg_val = f"{spx['zero_gamma']:.1f}" if spx["zero_gamma"] else "N/A"
 st.subheader("Quick-Copy Levels for TradingView")
-st.code(
-    f"Put Wall: {spx['put_wall'][0]:.0f} | King: {spx['king'][0]:.0f} | Call Wall: {spx['call_wall'][0]:.0f} | Zero Gamma: {zg_val}",
-    language="text"
-)
-st.caption(f"Refreshed: {datetime.now().strftime('%H:%M:%S')} | Cboe 15-min delayed data | Confirm final entries with live ES CVD & NYSE $TICK on TradingView.")
+st.code(f"Put Wall: {spx['put_wall'][0]:.0f} | King: {spx['king'][0]:.0f} | Call Wall: {spx['call_wall'][0]:.0f} | Zero Gamma: {zg_val}", language="text")
