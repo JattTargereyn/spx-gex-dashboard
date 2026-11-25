@@ -27,6 +27,8 @@ def fetch_json(url):
         st.error(f"Cboe returned HTTP {r.status_code} for {url}")
         st.stop()
     return r.json()["data"]
+
+def bs_greeks(S, K, T, sigma, r=0.04):
     T = np.maximum(T, 10.0 / (252.0 * 390.0))
     sqrt_T = np.sqrt(T)
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
@@ -74,7 +76,6 @@ def analyze_chain(chain, scope="All Exp"):
 
     gex = sign * gamma * OI * 100.0 * (spot**2) * 0.01
     vex = sign * vanna * OI * 100.0 * spot * 0.01
-    # Hourly charm in ES-equivalent futures (1 ES = $50/pt)
     charm_es_hr = (sign * charm * OI * 100.0 / (252.0 * 6.5)).sum() * (spot / 50.0) / 100.0
 
     uniq = np.unique(K)
@@ -90,7 +91,6 @@ def analyze_chain(chain, scope="All Exp"):
     put_wall = min(put_k, key=put_k.get)
     king = max(net_k, key=lambda x: abs(net_k[x]))
 
-    # True Spot-Shift Zero Gamma (±6%)
     grid = np.linspace(spot * 0.94, spot * 1.06, 51)
     totals = np.array([(sign * bs_greeks(s, K, T, sigma)[0] * OI * 100.0 * (s**2) * 0.01).sum() for s in grid])
     cross = np.where(np.diff(np.sign(totals)) != 0)[0]
