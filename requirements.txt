@@ -2,3 +2,4 @@ streamlit
 curl_cffi
 numpy
 plotly
+yfinance
