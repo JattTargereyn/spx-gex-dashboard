@@ -487,9 +487,11 @@ else:
 
 zg_num = f"{spx['zero_gamma']:.1f}" if spx["zero_gamma"] else "0"
 basis_val = matched_basis if matched_basis is not None else (round(es["es_last"] - spx["spot"], 2) if es else 0.0)
-tv_string = f"{spx['put_wall'][0]:.0f},{spx['king'][0]:.0f},{spx['call_wall'][0]:.0f},{zg_num},{basis_val:.2f},{up_tgt:.0f},{dn_tgt:.0f}"
+gamma_flag = 1 if spx["net_gex"] >= 0 else -1
+tv_string = f"{spx['put_wall'][0]:.0f},{spx['king'][0]:.0f},{spx['call_wall'][0]:.0f},{zg_num},{basis_val:.2f},{up_tgt:.0f},{dn_tgt:.0f},{score},{gamma_flag}"
 
-st.subheader("1-Paste String for TradingView Indicator")
+st.subheader("1-Paste String for TradingView Live Engine")
 st.text_input("Tap, Select All, and Copy:", value=tv_string, label_visibility="collapsed")
-st.caption(f"Format: Put, King, Call, Zero Γ, Matched Basis (`{basis_val:+.2f}`), Up Target (`{up_tgt:.0f}`), Dn Target (`{dn_tgt:.0f}`)")
+st.caption(f"9-Value Format: Put, King, Call, Zero Γ, Basis ({basis_val:+.2f}), UpTgt, DnTgt, MacroScore ({score:+d}), Gamma ({gamma_flag:+d})")
+
 
