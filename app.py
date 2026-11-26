@@ -11,12 +11,23 @@ from zoneinfo import ZoneInfo
 st.set_page_config(page_title="SPX & ES GEX Dashboard", layout="wide")
 NY = ZoneInfo("America/New_York")
 
+CBOE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.cboe.com/",
+    "Origin": "https://www.cboe.com",
+}
+
+
 # --- 1. DATA FETCHERS ---
 @st.cache_data(ttl=60)
 def fetch_cboe_chain(ticker: str):
     url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker}.json"
-    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
-    r.raise_for_status()
+    r = requests.get(url, headers=CBOE_HEADERS, timeout=20)
+    if r.status_code != 200:
+        st.error(f"Cboe API returned HTTP {r.status_code} for {ticker}. Try refreshing in a minute.")
+        st.stop()
     data = r.json()["data"]
     spot = float(data["current_price"])
     today_yymmdd = datetime.now(NY).strftime("%y%m%d")
