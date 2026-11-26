@@ -106,7 +106,6 @@ def fetch_market_data():
     vix = yf.Ticker("^VIX").history(period="2d", interval="5m")
     vix1d = yf.Ticker("^VIX1D").history(period="1d", interval="5m")
 
-    # Matched 1m ES-SPX basis
     basis = 0.0
     if not es_1m.empty and not spx_1m.empty:
         common = es_1m.index.intersection(spx_1m.index)
@@ -153,7 +152,6 @@ score += 1 if qqq["spot"] >= qqq["king"] else -1
 gamma_flag = 1 if spx["net_gex"] >= 0 else -1
 gamma_txt = "POSITIVE GAMMA (Chop / Mean-Revert)" if gamma_flag == 1 else "NEGATIVE GAMMA (Fast / Trending)"
 
-# Top Banner
 if score >= 2:
     st.success(f"BULLISH BIAS ({score:+d}/5) — {gamma_txt}")
 elif score <= -2:
@@ -161,7 +159,6 @@ elif score <= -2:
 else:
     st.warning(f"NEUTRAL / MIXED ({score:+d}/5) — {gamma_txt}")
 
-# Key Metrics Row
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("SPX Spot", f"{spx['spot']:.2f}", f"Basis {basis_val:+.2f}")
 c2.metric("Put Wall (ES)", f"{spx['put_wall'] + basis_val:.1f}", f"SPX {spx['put_wall']:.0f}")
@@ -169,7 +166,45 @@ c3.metric("King Node (ES)", f"{spx['king'] + basis_val:.1f}", f"SPX {spx['king']
 c4.metric("Call Wall (ES)", f"{spx['call_wall'] + basis_val:.1f}", f"SPX {spx['call_wall']:.0f}")
 c5.metric("VIX / VIX1D", f"{vix_now:.2f} ({vix_chg:+.2f})", f"Ratio {fear_ratio:.2f}")
 
-# --- 3. 9:30–9:45 AM ET OPENING RANGE (WITH EXTENDED SQUEEZE FIX) ---
+# --- 3. SPX GAMMA EXPOSURE (GEX) PROFILE BARS ---
+st.subheader("SPX Net Gamma Exposure (GEX) Profile")
+gex_df = spx["df"]
+gex_view = gex_df[(gex_df["strike"] >= spx["spot"] - 250) & (gex_df["strike"] <= spx["spot"] + 250)].copy()
+
+bar_colors = ["#00e676" if val >= 0 else "#ff4081" for val in gex_view["gex"]]
+gex_fig = go.Figure(data=[go.Bar(
+    x=gex_view["gex"] / 1e6,
+    y=gex_view["strike"],
+    orientation="h",
+    marker_color=bar_colors,
+    name="Net GEX ($M)"
+)])
+gex_fig.add_hline(
+    y=spx["spot"],
+    line_dash="dash",
+    line_color="#ffd740",
+    annotation_text=f"SPX Spot {spx['spot']:.1f}",
+    annotation_position="top right"
+)
+if spx["zero_g"] > 0:
+    gex_fig.add_hline(
+        y=spx["zero_g"],
+        line_dash="dot",
+        line_color="#ff9100",
+        annotation_text=f"Zero Γ {spx['zero_g']:.1f}",
+        annotation_position="bottom right"
+    )
+gex_fig.update_layout(
+    template="plotly_dark",
+    xaxis_title="Net GEX ($ Millions per 1% Move)",
+    yaxis_title="SPX Strike",
+    height=520,
+    margin=dict(l=10, r=10, t=20, b=10),
+    showlegend=False
+)
+st.plotly_chart(gex_fig, use_container_width=True)
+
+# --- 4. 9:30–9:45 AM ET OPENING RANGE ---
 st.subheader("9:30–9:45 AM ET Opening Range (ES Futures)")
 if not es_5m.empty:
     if es_5m.index.tz is None:
@@ -211,7 +246,7 @@ if not es_5m.empty:
     else:
         st.caption("Waiting for 9:30–9:45 AM ET Opening Range bars.")
 
-# --- 4. INTRADAY 5M ES CANDLES + HISTORICAL GEX WALL SHIFTS ---
+# --- 5. INTRADAY 5M ES CANDLES + HISTORICAL GEX WALL SHIFTS ---
 st.subheader("Intraday 5m ES Candles + Historical GEX Wall Shifts")
 if not es_5m.empty:
     es_rth = es_5m.between_time("09:30", "16:15")
@@ -227,7 +262,11 @@ if not es_5m.empty:
 
         if os.path.exists("gex_history.csv"):
             hist = pd.read_csv("gex_history.csv")
-            hist["timestamp_et"] = pd.to_datetime(hist["timestamp_et"]).dt.tz_localize(NY)
+            hist["timestamp_et"] = pd.to_datetime(hist["timestamp_et"])
+            if hist["timestamp_et"].dt.tz is None:
+                hist["timestamp_et"] = hist["timestamp_et"].dt.tz_localize(NY)
+            else:
+                hist["timestamp_et"] = hist["timestamp_et"].dt.tz_convert(NY)
             today_str = es_rth.index[-1].strftime("%Y-%m-%d")
             hist_today = hist[hist["timestamp_et"].dt.strftime("%Y-%m-%d") == today_str]
 
@@ -261,7 +300,7 @@ if not es_5m.empty:
         )
         st.plotly_chart(fig, use_container_width=True)
 
-# --- 5. 0DTE FLOW SPLIT ---
+# --- 6. 0DTE FLOW SPLIT ---
 total_0dte = spx["call_0dte_vol"] + spx["put_0dte_vol"]
 if total_0dte > 0:
     c_pct = spx["call_0dte_vol"] / total_0dte * 100
@@ -269,10 +308,9 @@ if total_0dte > 0:
     st.subheader("0DTE Flow Split")
     st.write(f"**{c_pct:.0f}% Calls** ({spx['call_0dte_vol']:,}) vs **{p_pct:.0f}% Puts** ({spx['put_0dte_vol']:,})")
 
-# --- 6. 1-PASTE STRING FOR TRADINGVIEW ---
+# --- 7. 1-PASTE STRING FOR TRADINGVIEW ---
 tv_string = f"{spx['put_wall']:.0f},{spx['king']:.0f},{spx['call_wall']:.0f},{spx['zero_g']:.1f},{basis_val:.2f},{spx['up_tgt']:.0f},{spx['dn_tgt']:.0f},{score},{gamma_flag}"
 
 st.subheader("1-Paste String for TradingView Live Engine")
 st.text_input("Tap, Select All, and Copy:", value=tv_string, label_visibility="collapsed")
 st.caption(f"9-Value Format: Put, King, Call, Zero Γ, Basis ({basis_val:+.2f}), UpTgt, DnTgt, MacroScore ({score:+d}), Gamma ({gamma_flag:+d})")
-
