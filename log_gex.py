@@ -9,7 +9,15 @@ from zoneinfo import ZoneInfo
 NY = ZoneInfo("America/New_York")
 now_ny = datetime.now(NY)
 
-# Only log during RTH (09:30 - 16:15 ET) so DST changes never log junk
+CBOE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.cboe.com/",
+    "Origin": "https://www.cboe.com",
+}
+
+# Only log during RTH (09:30 - 16:15 ET)
 if not (930 <= now_ny.hour * 100 + now_ny.minute <= 1615):
     print(f"Outside RTH ({now_ny.strftime('%H:%M ET')}). Skipping.")
     raise SystemExit(0)
@@ -26,7 +34,7 @@ def get_es_spx_basis():
 
 def fetch_cboe_spx():
     url = "https://cdn.cboe.com/api/global/delayed_quotes/options/_SPX.json"
-    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+    r = requests.get(url, headers=CBOE_HEADERS, timeout=20)
     r.raise_for_status()
     data = r.json()["data"]
     spot = float(data["current_price"])
@@ -34,7 +42,6 @@ def fetch_cboe_spx():
     rows = []
     for opt in data["options"]:
         sym = opt["option"]
-        # Parse strike & type from OCC symbol (e.g., SPX261125C07000000)
         opt_type = sym[-9]
         strike = int(sym[-8:]) / 1000.0
         oi = float(opt.get("open_interest") or 0)
@@ -54,10 +61,10 @@ def fetch_cboe_spx():
     king = float(df.loc[df["gex"].abs().idxmax(), "strike"])
     net_gex = float(df["gex"].sum())
 
-    # Zero Gamma (cumulative GEX sign flip)
+    # Zero Gamma: cumulative GEX sign flip nearest to spot
     df["cum_gex"] = df["gex"].cumsum()
     flips = df[(df["cum_gex"].shift(1) * df["cum_gex"]) <= 0]
-    zero_g = float(flips.iloc[0]["strike"]) if not flips.empty else 0.0
+    zero_g = float(flips.loc[(flips["strike"] - spot).abs().idxmin(), "strike"]) if not flips.empty else 0.0
 
     return spot, put_wall, king, call_wall, zero_g, net_gex
 
