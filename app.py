@@ -34,6 +34,8 @@ def fetch_cboe_chain(ticker: str):
 
     rows = []
     call_0dte_vol, put_0dte_vol = 0, 0
+    calls_0dte_iv, puts_0dte_iv = [], []
+
     for opt in data["options"]:
         sym = opt["option"]
         opt_type = sym[-9]
@@ -44,12 +46,18 @@ def fetch_cboe_chain(ticker: str):
         gamma = float(opt.get("gamma") or 0)
         vega = float(opt.get("vega") or 0)
         theta = float(opt.get("theta") or 0)
+        iv = float(opt.get("iv") or 0)
+        delta = float(opt.get("delta") or 0)
 
         if exp_str == today_yymmdd:
             if opt_type == "C":
                 call_0dte_vol += vol
+                if iv > 0 and strike > spot:
+                    calls_0dte_iv.append((strike, delta, iv))
             else:
                 put_0dte_vol += vol
+                if iv > 0 and strike < spot:
+                    puts_0dte_iv.append((strike, delta, iv))
 
         if oi <= 0 or gamma == 0:
             continue
@@ -59,6 +67,18 @@ def fetch_cboe_chain(ticker: str):
         vex = sign * vega * oi * 100
         charm = -sign * theta * oi * 100
         rows.append((strike, gex, vex, charm, exp_str == today_yymmdd))
+
+    # 0DTE 25-Delta IV Skew (Put IV - Call IV, in percentage points)
+    put_iv_25, call_iv_25, iv_skew = None, None, None
+    if puts_0dte_iv and calls_0dte_iv:
+        has_deltas = any(d != 0 for _, d, _ in puts_0dte_iv) and any(d != 0 for _, d, _ in calls_0dte_iv)
+        if has_deltas:
+            put_iv_25 = min(puts_0dte_iv, key=lambda x: abs(x[1] - (-0.25)))[2] * 100.0
+            call_iv_25 = min(calls_0dte_iv, key=lambda x: abs(x[1] - 0.25))[2] * 100.0
+        else:
+            put_iv_25 = min(puts_0dte_iv, key=lambda x: abs(x[0] - spot * 0.9925))[2] * 100.0
+            call_iv_25 = min(calls_0dte_iv, key=lambda x: abs(x[0] - spot * 1.0075))[2] * 100.0
+        iv_skew = round(put_iv_25 - call_iv_25, 2)
 
     df = pd.DataFrame(rows, columns=["strike", "gex", "vex", "charm", "is_0dte"])
     df = df[(df["strike"] >= spot * 0.90) & (df["strike"] <= spot * 1.10)]
@@ -74,7 +94,6 @@ def fetch_cboe_chain(ticker: str):
     agg["cum_gex"] = agg["gex"].cumsum()
     flips = agg[(agg["cum_gex"].shift(1) * agg["cum_gex"]) <= 0]
     zero_g = float(flips.loc[(flips["strike"] - spot).abs().idxmin(), "strike"]) if not flips.empty else 0.0
-
 
     above = agg[(agg["strike"] > spot + 5) & (agg["gex"] > 0)]
     below = agg[(agg["strike"] < spot - 5) & (agg["gex"] < 0)]
@@ -94,6 +113,9 @@ def fetch_cboe_chain(ticker: str):
         "dn_tgt": dn_tgt,
         "call_0dte_vol": int(call_0dte_vol),
         "put_0dte_vol": int(put_0dte_vol),
+        "put_iv_25": round(put_iv_25, 2) if put_iv_25 is not None else None,
+        "call_iv_25": round(call_iv_25, 2) if call_iv_25 is not None else None,
+        "iv_skew": iv_skew,
         "df": agg,
     }
 
@@ -309,13 +331,36 @@ if not spx_5m.empty:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-# --- 6. 0DTE FLOW SPLIT ---
-total_0dte = spx["call_0dte_vol"] + spx["put_0dte_vol"]
-if total_0dte > 0:
-    c_pct = spx["call_0dte_vol"] / total_0dte * 100
-    p_pct = spx["put_0dte_vol"] / total_0dte * 100
-    st.subheader("0DTE Flow Split")
-    st.write(f"**{c_pct:.0f}% Calls** ({spx['call_0dte_vol']:,}) vs **{p_pct:.0f}% Puts** ({spx['put_0dte_vol']:,})")
+# --- 6. 0DTE FLOW SPLIT & 25-DELTA IV SKEW ---
+st.subheader("0DTE Flow Split & IV Skew")
+f1, f2 = st.columns(2)
+
+with f1:
+    total_0dte = spx["call_0dte_vol"] + spx["put_0dte_vol"]
+    if total_0dte > 0:
+        c_pct = spx["call_0dte_vol"] / total_0dte * 100
+        p_pct = spx["put_0dte_vol"] / total_0dte * 100
+        st.metric("0DTE Volume Split", f"{c_pct:.0f}% C / {p_pct:.0f}% P", f"C: {spx['call_0dte_vol']:,} | P: {spx['put_0dte_vol']:,}")
+    else:
+        st.metric("0DTE Volume Split", "N/A", "No active 0DTE volume")
+
+with f2:
+    if spx["iv_skew"] is not None:
+        skew_val = spx["iv_skew"]
+        if skew_val >= 4.0:
+            skew_read = "Steep (Put Bid / Breakdown Risk)"
+        elif skew_val <= 1.5:
+            skew_read = "Flat/Inverted (Call Bid / Squeeze Risk)"
+        else:
+            skew_read = "Normal Baseline (Balanced)"
+        st.metric(
+            "0DTE 25Δ IV Skew (Put − Call)",
+            f"{skew_val:+.2f}%",
+            f"Put IV {spx['put_iv_25']:.1f}% vs Call IV {spx['call_iv_25']:.1f}%"
+        )
+        st.caption(f"Read: **{skew_read}**")
+    else:
+        st.metric("0DTE 25Δ IV Skew (Put − Call)", "N/A", "Active during RTH 0DTE session")
 
 # --- 7. 1-PASTE STRING FOR TRADINGVIEW ---
 tv_string = f"{spx['put_wall']:.0f},{spx['king']:.0f},{spx['call_wall']:.0f},{spx['zero_g']:.1f},{basis_val:.2f},{spx['up_tgt']:.0f},{spx['dn_tgt']:.0f},{score},{gamma_flag}"
