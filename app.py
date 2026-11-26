@@ -73,7 +73,8 @@ def fetch_cboe_chain(ticker: str):
 
     agg["cum_gex"] = agg["gex"].cumsum()
     flips = agg[(agg["cum_gex"].shift(1) * agg["cum_gex"]) <= 0]
-    zero_g = float(flips.iloc[0]["strike"]) if not flips.empty else 0.0
+    zero_g = float(flips.loc[(flips["strike"] - spot).abs().idxmin(), "strike"]) if not flips.empty else 0.0
+
 
     above = agg[(agg["strike"] > spot + 5) & (agg["gex"] > 0)]
     below = agg[(agg["strike"] < spot - 5) & (agg["gex"] < 0)]
