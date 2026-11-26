@@ -1,15 +1,17 @@
 import os
+import math
 import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import streamlit as st
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="SPX & ES GEX Dashboard", layout="wide")
 NY = ZoneInfo("America/New_York")
+BASIS_FILE = "last_basis.txt"
 
 CBOE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
@@ -20,20 +22,40 @@ CBOE_HEADERS = {
 }
 
 
+def years_to_expiry(exp_date) -> float:
+    """Exact time to 4:00 PM ET expiry in years, floored at 15 minutes."""
+    exp_dt = datetime.combine(exp_date, dtime(16, 0), tzinfo=NY)
+    secs = (exp_dt - datetime.now(NY)).total_seconds()
+    return max(secs, 15 * 60) / (365 * 24 * 3600)
+
+
+def bs_vanna_charm(spot: float, strike: float, t_years: float, iv: float):
+    """True Black-Scholes Vanna (dDelta/dVol) and Charm (-dDelta/dT, r=0)."""
+    if spot <= 0 or strike <= 0 or t_years <= 0 or iv <= 0:
+        return 0.0, 0.0
+    sqrt_t = math.sqrt(t_years)
+    d1 = (math.log(spot / strike) + 0.5 * (iv ** 2) * t_years) / (iv * sqrt_t)
+    d2 = d1 - iv * sqrt_t
+    pdf_d1 = math.exp(-0.5 * d1 * d1) / math.sqrt(2.0 * math.pi)
+    vanna = -pdf_d1 * (d2 / iv)
+    charm = pdf_d1 * (d2 / (2.0 * t_years))
+    return vanna, charm
+
+
 def compute_gex_metrics(rows, spot):
     if not rows:
         return None
-    df = pd.DataFrame(rows, columns=["strike", "gex", "vex", "charm"])
+    df = pd.DataFrame(rows, columns=["strike", "gex", "vanna", "charm"])
     df = df[(df["strike"] >= spot * 0.90) & (df["strike"] <= spot * 1.10)]
     if df.empty:
         return None
-    agg = df.groupby("strike", as_index=False)[["gex", "vex", "charm"]].sum().sort_values("strike")
+    agg = df.groupby("strike", as_index=False)[["gex", "vanna", "charm"]].sum().sort_values("strike")
 
     put_wall = float(agg.loc[agg["gex"].idxmin(), "strike"])
     call_wall = float(agg.loc[agg["gex"].idxmax(), "strike"])
     king = float(agg.loc[agg["gex"].abs().idxmax(), "strike"])
     net_gex = float(agg["gex"].sum())
-    net_vex = float(agg["vex"].sum())
+    net_vanna = float(agg["vanna"].sum())
     net_charm = float(agg["charm"].sum())
 
     agg["cum_gex"] = agg["gex"].cumsum()
@@ -51,7 +73,7 @@ def compute_gex_metrics(rows, spot):
         "call_wall": call_wall,
         "zero_g": zero_g,
         "net_gex": net_gex,
-        "net_vex": net_vex,
+        "net_vanna": net_vanna,
         "net_charm": net_charm,
         "up_tgt": up_tgt,
         "dn_tgt": dn_tgt,
@@ -70,6 +92,27 @@ def compute_iv_skew(puts_iv, calls_iv, spot):
         put_iv_25 = min(puts_iv, key=lambda x: abs(x[0] - spot * 0.9925))[2] * 100.0
         call_iv_25 = min(calls_iv, key=lambda x: abs(x[0] - spot * 1.0075))[2] * 100.0
     return round(put_iv_25, 2), round(call_iv_25, 2), round(put_iv_25 - call_iv_25, 2)
+
+
+def log_snapshot(d, every_min: int = 15):
+    now = datetime.now(NY)
+    if now.weekday() >= 5 or not (570 <= now.hour * 60 + now.minute <= 960):
+        return
+    path = "gex_history.csv"
+    if os.path.exists(path):
+        last = pd.read_csv(path, usecols=["timestamp_et"]).tail(1)
+        if not last.empty:
+            age = (now.replace(tzinfo=None) - pd.to_datetime(last.iloc[0, 0])).total_seconds()
+            if age < every_min * 60:
+                return
+    row = {
+        "timestamp_et": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "call_wall": d["call_wall"],
+        "king": d["king"],
+        "put_wall": d["put_wall"],
+        "zero_gamma": d["zero_g"],
+    }
+    pd.DataFrame([row]).to_csv(path, mode="a", header=not os.path.exists(path), index=False)
 
 
 # --- 1. DATA FETCHERS ---
@@ -105,8 +148,6 @@ def fetch_cboe_chain(ticker: str):
         oi = float(opt.get("open_interest") or 0)
         vol = float(opt.get("volume") or 0)
         gamma = float(opt.get("gamma") or 0)
-        vega = float(opt.get("vega") or 0)
-        theta = float(opt.get("theta") or 0)
         iv = float(opt.get("iv") or 0)
         delta = float(opt.get("delta") or 0)
 
@@ -129,14 +170,17 @@ def fetch_cboe_chain(ticker: str):
             continue
 
         sign = 1.0 if opt_type == "C" else -1.0
-        gex = sign * gamma * oi * 100 * (spot ** 2) * 0.01
-        vex = sign * vega * oi * 100
-        charm = -sign * theta * oi * 100
-        all_rows.append((strike, gex, vex, charm))
-        if 1 <= dte <= 7:
-            wk_rows.append((strike, gex, vex, charm))
+        t_years = years_to_expiry(exp_date)
+        vanna_unit, charm_unit = bs_vanna_charm(spot, strike, t_years, iv)
 
-    # Target Friday (or furthest expiry in 1-7 DTE) for Weekly IV Skew
+        gex = sign * gamma * oi * 100 * (spot ** 2) * 0.01
+        vanna_exp = sign * vanna_unit * oi * 100 * spot * 0.01
+        charm_exp = sign * charm_unit * oi * 100 * spot / 365.0
+
+        all_rows.append((strike, gex, vanna_exp, charm_exp))
+        if 1 <= dte <= 7:
+            wk_rows.append((strike, gex, vanna_exp, charm_exp))
+
     target_wk_exp = None
     if wk_exp_dates:
         fridays = sorted([d for d in wk_exp_dates if d.weekday() == 4])
@@ -149,7 +193,10 @@ def fetch_cboe_chain(ticker: str):
     wk_put_iv_25, wk_call_iv_25, wk_iv_skew = compute_iv_skew(puts_wk_iv, calls_wk_iv, spot)
 
     intra = compute_gex_metrics(all_rows, spot)
-    weekly = compute_gex_metrics(wk_rows, spot) if wk_rows else intra
+    if intra is None:
+        st.error(f"Cboe returned an empty or invalid options chain for {ticker}.")
+        st.stop()
+    weekly = (compute_gex_metrics(wk_rows, spot) if wk_rows else None) or intra
 
     return {
         "spot": spot,
@@ -169,52 +216,82 @@ def fetch_cboe_chain(ticker: str):
     }
 
 
+def _to_ny(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    df.index = df.index.tz_localize("UTC").tz_convert(NY) if df.index.tz is None else df.index.tz_convert(NY)
+    return df
+
+
 @st.cache_data(ttl=60)
 def fetch_market_data():
-    es_1m = yf.Ticker("ES=F").history(period="1d", interval="1m")
-    spx_1m = yf.Ticker("^GSPC").history(period="1d", interval="1m")
-    es_5m = yf.Ticker("ES=F").history(period="1d", interval="5m")
-    spx_5m = yf.Ticker("^GSPC").history(period="1d", interval="5m")
-    vix = yf.Ticker("^VIX").history(period="2d", interval="5m")
-    vix1d = yf.Ticker("^VIX1D").history(period="1d", interval="5m")
-    vix3m = yf.Ticker("^VIX3M").history(period="2d", interval="5m")
+    es_1m = _to_ny(yf.Ticker("ES=F").history(period="1d", interval="1m"))
+    spx_1m = _to_ny(yf.Ticker("^GSPC").history(period="1d", interval="1m"))
+    es_5m = _to_ny(yf.Ticker("ES=F").history(period="1d", interval="5m"))
+    spx_5m = _to_ny(yf.Ticker("^GSPC").history(period="1d", interval="5m"))
+    vix = _to_ny(yf.Ticker("^VIX").history(period="2d", interval="5m"))
+    vix1d = _to_ny(yf.Ticker("^VIX1D").history(period="1d", interval="5m"))
+    vix3m = _to_ny(yf.Ticker("^VIX3M").history(period="2d", interval="5m"))
 
-    basis = 0.0
+    # RTH-only matched timestamp basis with last-known RTH fallback
+    basis, basis_live, basis_cached = 0.0, False, False
     if not es_1m.empty and not spx_1m.empty:
         common = es_1m.index.intersection(spx_1m.index)
         if len(common) > 0:
             basis = float(es_1m.loc[common[-1], "Close"] - spx_1m.loc[common[-1], "Close"])
-        else:
-            basis = float(es_1m["Close"].iloc[-1] - spx_1m["Close"].iloc[-1])
+            basis_live = True
 
-    vix_now = float(vix["Close"].iloc[-1]) if not vix.empty else 0.0
-    vix_chg = float(vix["Close"].iloc[-1] - vix["Open"].iloc[0]) if not vix.empty else 0.0
+    if basis_live:
+        with open(BASIS_FILE, "w") as f:
+            f.write(f"{basis}")
+    elif os.path.exists(BASIS_FILE):
+        with open(BASIS_FILE) as f:
+            basis = float(f.read().strip())
+            basis_cached = True
+
+    # Today-only VIX change
+    vix_now, vix_chg = 0.0, 0.0
+    if not vix.empty:
+        vix_now = float(vix["Close"].iloc[-1])
+        today_ny = datetime.now(NY).date()
+        vix_today = vix[vix.index.date == today_ny]
+        if not vix_today.empty:
+            vix_chg = float(vix_today["Close"].iloc[-1] - vix_today["Open"].iloc[0])
+
     vix1d_now = float(vix1d["Close"].iloc[-1]) if not vix1d.empty else vix_now
     vix3m_now = float(vix3m["Close"].iloc[-1]) if not vix3m.empty else vix_now
 
-    return es_5m, spx_5m, round(basis, 2), round(vix_now, 2), round(vix_chg, 2), round(vix1d_now, 2), round(vix3m_now, 2)
+    return es_5m, spx_5m, round(basis, 2), basis_live, basis_cached, round(vix_now, 2), round(vix_chg, 2), round(vix1d_now, 2), round(vix3m_now, 2)
 
 
 # --- 2. LOAD DATA ---
 now_str = datetime.now(NY).strftime("%Y-%m-%d %H:%M:%S ET")
 st.title("SPX & ES Live GEX Dashboard")
-st.caption(f"Last refreshed: {now_str}")
+st.caption(f"Last refreshed: {now_str} | Note: Cboe OI updates overnight (Morning Map)")
 
 if st.button("Refresh Live Data"):
     st.cache_data.clear()
 
 spx = fetch_cboe_chain("_SPX")
 qqq = fetch_cboe_chain("QQQ")
-es_5m, spx_5m, basis_val, vix_now, vix_chg, vix1d_now, vix3m_now = fetch_market_data()
+es_5m, spx_5m, basis_val, basis_live, basis_cached, vix_now, vix_chg, vix1d_now, vix3m_now = fetch_market_data()
+log_snapshot(spx)
 
-tab1, tab2 = st.tabs(["0DTE Intraday", "3–4 DTE Weekly Swing"])
+if not basis_live:
+    if basis_cached:
+        st.info(f"Outside RTH: Using last saved RTH basis ({basis_val:+.2f}) until 9:30 AM ET.")
+    else:
+        st.warning("Outside RTH: No saved RTH basis yet (set to 0.00). Use Manual Basis Override in TradingView until 9:30 AM ET.")
+
+tab1, tab2 = st.tabs(["Total GEX Morning Map (All Expiries)", "1–7 DTE Weekly Map"])
 
 # ==============================================================================
-# TAB 1: 0DTE INTRADAY (UNTOUCHED)
+# TAB 1: TOTAL GEX MORNING MAP (ALL EXPIRIES)
 # ==============================================================================
 with tab1:
     score = 0
-    if spx["net_vex"] > 0 and vix_chg < -0.20:
+    if spx["net_vanna"] > 0 and vix_chg < -0.20:
         score += 2
     elif vix_chg > 0.20:
         score -= 2
@@ -225,7 +302,8 @@ with tab1:
     elif fear_ratio > 1.05:
         score -= 1
 
-    score += 1 if spx["net_charm"] > 0 else -1
+    # net_charm < 0 -> dealer delta decaying -> hedge buy-back -> bullish
+    score += 1 if spx["net_charm"] < 0 else -1
     score += 1 if qqq["spot"] >= qqq["king"] else -1
 
     gamma_flag = 1 if spx["net_gex"] >= 0 else -1
@@ -238,8 +316,9 @@ with tab1:
     else:
         st.warning(f"NEUTRAL / MIXED ({score:+d}/5) — {gamma_txt}")
 
+    basis_delta = f"Basis {basis_val:+.2f}" if basis_live else (f"Last RTH {basis_val:+.2f}" if basis_cached else "Basis Stale")
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("SPX Spot", f"{spx['spot']:.2f}", f"Basis {basis_val:+.2f}")
+    c1.metric("SPX Spot", f"{spx['spot']:.2f}", basis_delta)
     c2.metric("Put Wall (ES)", f"{spx['put_wall'] + basis_val:.1f}", f"SPX {spx['put_wall']:.0f}")
     c3.metric("King Node (ES)", f"{spx['king'] + basis_val:.1f}", f"SPX {spx['king']:.0f}")
     c4.metric("Call Wall (ES)", f"{spx['call_wall'] + basis_val:.1f}", f"SPX {spx['call_wall']:.0f}")
@@ -265,10 +344,8 @@ with tab1:
 
     st.subheader("9:30–9:45 AM ET Opening Range (ES Futures)")
     if not es_5m.empty:
-        es_df = es_5m.copy()
-        es_df.index = es_df.index.tz_localize("UTC").tz_convert(NY) if es_df.index.tz is None else es_df.index.tz_convert(NY)
-        es_rth = es_df.between_time("09:30", "16:15")
-        or_bars = es_df.between_time("09:30", "09:44")
+        es_rth = es_5m.between_time("09:30", "16:15")
+        or_bars = es_5m.between_time("09:30", "09:44")
 
         if not or_bars.empty and not es_rth.empty:
             or_high = float(or_bars["High"].max())
@@ -303,17 +380,15 @@ with tab1:
 
     st.subheader("Intraday 5m SPX Candles + Historical GEX Wall Shifts")
     if not spx_5m.empty:
-        spx_df = spx_5m.copy()
-        spx_df.index = spx_df.index.tz_localize("UTC").tz_convert(NY) if spx_df.index.tz is None else spx_df.index.tz_convert(NY)
         fig = go.Figure(data=[go.Candlestick(
-            x=spx_df.index, open=spx_df["Open"], high=spx_df["High"], low=spx_df["Low"], close=spx_df["Close"], name="SPX 5m"
+            x=spx_5m.index, open=spx_5m["Open"], high=spx_5m["High"], low=spx_5m["Low"], close=spx_5m["Close"], name="SPX 5m"
         )])
 
         drew_history = False
         if os.path.exists("gex_history.csv"):
             hist = pd.read_csv("gex_history.csv")
             hist["timestamp_et"] = pd.to_datetime(hist["timestamp_et"]).dt.tz_localize(NY)
-            today_str = spx_df.index[-1].strftime("%Y-%m-%d")
+            today_str = spx_5m.index[-1].strftime("%Y-%m-%d")
             hist_today = hist[hist["timestamp_et"].dt.strftime("%Y-%m-%d") == today_str]
             if not hist_today.empty:
                 drew_history = True
@@ -326,7 +401,7 @@ with tab1:
                                              name=label, line=dict(color=color, width=2, shape="hv"), marker=dict(size=4)))
 
         if not drew_history:
-            st.caption("Showing current live SPX GEX levels (stepped 15m wall shifts will appear automatically during RTH).")
+            st.caption("Showing current live SPX GEX levels (stepped 15m wall shifts log automatically during RTH).")
             for val, label, color in [
                 (spx["call_wall"], f"Call Wall {spx['call_wall']:.0f}", "#00e5ff"),
                 (spx["king"],      f"King {spx['king']:.0f}",           "#ffd740"),
@@ -360,26 +435,25 @@ with tab1:
             st.metric("0DTE 25Δ IV Skew (Put − Call)", "N/A", "Active during RTH 0DTE session")
 
     tv_string = f"{spx['put_wall']:.0f},{spx['king']:.0f},{spx['call_wall']:.0f},{spx['zero_g']:.1f},{basis_val:.2f},{spx['up_tgt']:.0f},{spx['dn_tgt']:.0f},{score},{gamma_flag}"
-    st.subheader("1-Paste String for TradingView 0DTE Engine")
-    st.text_input("Tap, Select All, and Copy (0DTE):", value=tv_string, label_visibility="collapsed", key="tv_0dte")
+    st.subheader("1-Paste String for TradingView Intraday Engine")
+    st.text_input("Tap, Select All, and Copy (Intraday):", value=tv_string, label_visibility="collapsed", key="tv_0dte")
     st.caption(f"9-Value Format: Put, King, Call, Zero Γ, Basis ({basis_val:+.2f}), UpTgt, DnTgt, MacroScore ({score:+d}), Gamma ({gamma_flag:+d})")
 
 # ==============================================================================
-# TAB 2: 3–4 DTE WEEKLY SWING (EX-0DTE, NEXT 1–7 DAYS)
+# TAB 2: 1–7 DTE WEEKLY MAP (EX-0DTE)
 # ==============================================================================
 with tab2:
     wk = spx["weekly"]
     qqq_wk = qqq["weekly"]
     term_ratio = (vix_now / vix3m_now) if vix3m_now > 0 else 1.0
 
-    # Weekly Swing Macro Score (-4 to +4)
     wk_score = 0
     if term_ratio < 0.92:
         wk_score += 2
     elif term_ratio > 1.00:
         wk_score -= 2
 
-    wk_score += 1 if wk["net_vex"] > 0 else -1
+    wk_score += 1 if wk["net_vanna"] > 0 else -1
     wk_score += 1 if qqq["spot"] >= qqq_wk["king"] else -1
 
     wk_gamma_flag = 1 if wk["net_gex"] >= 0 else -1
@@ -421,6 +495,6 @@ with tab2:
     st.plotly_chart(wk_fig, use_container_width=True)
 
     wk_tv_string = f"{wk['put_wall']:.0f},{wk['king']:.0f},{wk['call_wall']:.0f},{wk['zero_g']:.1f},{basis_val:.2f},{wk['up_tgt']:.0f},{wk['dn_tgt']:.0f},{wk_score},{wk_gamma_flag}"
-    st.subheader("1-Paste String for TradingView Weekly Swing Engine (1H / 4H)")
+    st.subheader("1-Paste String for TradingView Weekly Swing Engine (15m / 1H)")
     st.text_input("Tap, Select All, and Copy (Weekly):", value=wk_tv_string, label_visibility="collapsed", key="tv_weekly")
     st.caption(f"9-Value Format: WkPut, WkKing, WkCall, WkZeroΓ, Basis ({basis_val:+.2f}), UpTgt, DnTgt, WkScore ({wk_score:+d}), WkGamma ({wk_gamma_flag:+d})")
