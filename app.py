@@ -75,7 +75,6 @@ def fetch_cboe_chain(ticker: str):
     flips = agg[(agg["cum_gex"].shift(1) * agg["cum_gex"]) <= 0]
     zero_g = float(flips.iloc[0]["strike"]) if not flips.empty else 0.0
 
-    # Next upside & downside targets relative to spot
     above = agg[(agg["strike"] > spot + 5) & (agg["gex"] > 0)]
     below = agg[(agg["strike"] < spot - 5) & (agg["gex"] < 0)]
     up_tgt = float(above.loc[above["gex"].idxmax(), "strike"]) if not above.empty else call_wall
@@ -103,6 +102,7 @@ def fetch_market_data():
     es_1m = yf.Ticker("ES=F").history(period="1d", interval="1m")
     spx_1m = yf.Ticker("^GSPC").history(period="1d", interval="1m")
     es_5m = yf.Ticker("ES=F").history(period="1d", interval="5m")
+    spx_5m = yf.Ticker("^GSPC").history(period="1d", interval="5m")
     vix = yf.Ticker("^VIX").history(period="2d", interval="5m")
     vix1d = yf.Ticker("^VIX1D").history(period="1d", interval="5m")
 
@@ -118,7 +118,7 @@ def fetch_market_data():
     vix_chg = float(vix["Close"].iloc[-1] - vix["Open"].iloc[0]) if not vix.empty else 0.0
     vix1d_now = float(vix1d["Close"].iloc[-1]) if not vix1d.empty else vix_now
 
-    return es_5m, round(basis, 2), round(vix_now, 2), round(vix_chg, 2), round(vix1d_now, 2)
+    return es_5m, spx_5m, round(basis, 2), round(vix_now, 2), round(vix_chg, 2), round(vix1d_now, 2)
 
 
 # --- 2. LOAD DATA & COMPUTE MACRO SCORE ---
@@ -131,7 +131,7 @@ if st.button("Refresh Live Data"):
 
 spx = fetch_cboe_chain("_SPX")
 qqq = fetch_cboe_chain("QQQ")
-es_5m, basis_val, vix_now, vix_chg, vix1d_now = fetch_market_data()
+es_5m, spx_5m, basis_val, vix_now, vix_chg, vix1d_now = fetch_market_data()
 
 # Macro Confluence Score (-5 to +5)
 score = 0
@@ -204,7 +204,7 @@ gex_fig.update_layout(
 )
 st.plotly_chart(gex_fig, use_container_width=True)
 
-# --- 4. 9:30–9:45 AM ET OPENING RANGE ---
+# --- 4. 9:30–9:45 AM ET OPENING RANGE (ES FUTURES) ---
 st.subheader("9:30–9:45 AM ET Opening Range (ES Futures)")
 if not es_5m.empty:
     if es_5m.index.tz is None:
@@ -246,59 +246,67 @@ if not es_5m.empty:
     else:
         st.caption("Waiting for 9:30–9:45 AM ET Opening Range bars.")
 
-# --- 5. INTRADAY 5M ES CANDLES + HISTORICAL GEX WALL SHIFTS ---
-st.subheader("Intraday 5m ES Candles + Historical GEX Wall Shifts")
-if not es_5m.empty:
-    es_rth = es_5m.between_time("09:30", "16:15")
-    if not es_rth.empty:
-        fig = go.Figure(data=[go.Candlestick(
-            x=es_rth.index,
-            open=es_rth["Open"],
-            high=es_rth["High"],
-            low=es_rth["Low"],
-            close=es_rth["Close"],
-            name="ES 5m"
-        )])
+# --- 5. INTRADAY 5M SPX CANDLES + HISTORICAL GEX WALL SHIFTS ---
+st.subheader("Intraday 5m SPX Candles + Historical GEX Wall Shifts")
+if not spx_5m.empty:
+    if spx_5m.index.tz is None:
+        spx_5m.index = spx_5m.index.tz_localize("UTC").tz_convert(NY)
+    else:
+        spx_5m.index = spx_5m.index.tz_convert(NY)
 
-        if os.path.exists("gex_history.csv"):
-            hist = pd.read_csv("gex_history.csv")
-            hist["timestamp_et"] = pd.to_datetime(hist["timestamp_et"])
-            if hist["timestamp_et"].dt.tz is None:
-                hist["timestamp_et"] = hist["timestamp_et"].dt.tz_localize(NY)
-            else:
-                hist["timestamp_et"] = hist["timestamp_et"].dt.tz_convert(NY)
-            today_str = es_rth.index[-1].strftime("%Y-%m-%d")
-            hist_today = hist[hist["timestamp_et"].dt.strftime("%Y-%m-%d") == today_str]
+    fig = go.Figure(data=[go.Candlestick(
+        x=spx_5m.index,
+        open=spx_5m["Open"],
+        high=spx_5m["High"],
+        low=spx_5m["Low"],
+        close=spx_5m["Close"],
+        name="SPX 5m"
+    )])
 
-            if not hist_today.empty:
-                for col_name, label, color in [
-                    ("call_wall", "Call Wall (ES)", "#00e5ff"),
-                    ("king", "King Node (ES)", "#ffd740"),
-                    ("put_wall", "Put Wall (ES)", "#ff4081"),
-                    ("zero_gamma", "Zero Γ (ES)", "#ff9100"),
-                ]:
-                    es_vals = hist_today[col_name] + hist_today["basis"]
-                    fig.add_trace(go.Scatter(
-                        x=hist_today["timestamp_et"],
-                        y=es_vals,
-                        mode="lines+markers",
-                        name=label,
-                        line=dict(color=color, width=2, shape="hv"),
-                        marker=dict(size=4)
-                    ))
-            else:
-                st.caption("No GEX snapshots logged for today yet — waiting for next 15m GitHub Action run.")
-        else:
-            st.caption("`gex_history.csv` not found yet. Run the GitHub Action once to start logging.")
+    drew_history = False
+    if os.path.exists("gex_history.csv"):
+        hist = pd.read_csv("gex_history.csv")
+        hist["timestamp_et"] = pd.to_datetime(hist["timestamp_et"]).dt.tz_localize(NY)
+        today_str = spx_5m.index[-1].strftime("%Y-%m-%d")
+        hist_today = hist[hist["timestamp_et"].dt.strftime("%Y-%m-%d") == today_str]
 
-        fig.update_layout(
-            template="plotly_dark",
-            xaxis_rangeslider_visible=False,
-            height=500,
-            margin=dict(l=10, r=10, t=30, b=10),
-            legend=dict(orientation="h", y=1.02)
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        if not hist_today.empty:
+            drew_history = True
+            for col_name, label, color in [
+                ("call_wall", "Call Wall", "#00e5ff"),
+                ("king", "King Node", "#ffd740"),
+                ("put_wall", "Put Wall", "#ff4081"),
+                ("zero_gamma", "Zero Γ", "#ff9100"),
+            ]:
+                vals = hist_today[col_name].replace(0, np.nan)
+                fig.add_trace(go.Scatter(
+                    x=hist_today["timestamp_et"],
+                    y=vals,
+                    mode="lines+markers",
+                    name=label,
+                    line=dict(color=color, width=2, shape="hv"),
+                    marker=dict(size=4)
+                ))
+
+    if not drew_history:
+        st.caption("Showing current live SPX GEX levels (stepped 15m wall shifts will appear automatically during RTH).")
+        for val, label, color in [
+            (spx["call_wall"], f"Call Wall {spx['call_wall']:.0f}", "#00e5ff"),
+            (spx["king"],      f"King {spx['king']:.0f}",           "#ffd740"),
+            (spx["put_wall"],  f"Put Wall {spx['put_wall']:.0f}",   "#ff4081"),
+            (spx["zero_g"],    f"Zero Γ {spx['zero_g']:.1f}",       "#ff9100"),
+        ]:
+            if val > 0:
+                fig.add_hline(y=val, line_dash="dash", line_color=color, annotation_text=label, annotation_position="top left")
+
+    fig.update_layout(
+        template="plotly_dark",
+        xaxis_rangeslider_visible=False,
+        height=500,
+        margin=dict(l=10, r=10, t=30, b=10),
+        legend=dict(orientation="h", y=1.02)
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 # --- 6. 0DTE FLOW SPLIT ---
 total_0dte = spx["call_0dte_vol"] + spx["put_0dte_vol"]
